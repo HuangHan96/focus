@@ -191,6 +191,46 @@
       opacity: 1;
       transform: translateY(0);
     }
+    .tooltip-highlight {
+      position: fixed;
+      border: 2px solid rgba(251, 191, 36, 0.98);
+      border-radius: 12px;
+      background: rgba(251, 191, 36, 0.08);
+      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(255, 255, 255, 0.14) inset;
+      z-index: 9997;
+      pointer-events: none;
+      opacity: 0;
+      transform: scale(0.985);
+      transition: opacity 0.18s ease, transform 0.18s ease;
+      animation: tooltip-highlight-pulse 1.6s ease-in-out infinite;
+    }
+    .tooltip-highlight.visible {
+      opacity: 1;
+      transform: scale(1);
+    }
+    .tooltip-highlight-label {
+      position: absolute;
+      top: -12px;
+      left: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(24, 24, 27, 0.92);
+      color: #fef3c7;
+      border: 1px solid rgba(251, 191, 36, 0.35);
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1;
+      white-space: nowrap;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+    @keyframes tooltip-highlight-pulse {
+      0%, 100% { box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(255, 255, 255, 0.14) inset, 0 0 0 0 rgba(251, 191, 36, 0.18); }
+      50% { box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(255, 255, 255, 0.14) inset, 0 0 0 8px rgba(251, 191, 36, 0.08); }
+    }
     .tooltip-step {
       display: inline-flex;
       align-items: center;
@@ -856,10 +896,48 @@
 
     // --- Tooltips & Arrows ---
     let tooltipElements = [];
+    let tooltipOverlayElements = [];
 
     function clearTooltips() {
       tooltipElements.forEach(el => el.remove());
       tooltipElements = [];
+      tooltipOverlayElements.forEach(el => el.remove());
+      tooltipOverlayElements = [];
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
+    function positionTooltipNote(note, tooltip) {
+      const hasAnchor = Number.isFinite(Number(tooltip?.x)) && Number.isFinite(Number(tooltip?.y));
+      if (!hasAnchor) return;
+
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const margin = 16;
+      const offset = 20;
+      const anchorX = clamp(Number(tooltip.x), 0, viewportWidth);
+      const anchorY = clamp(Number(tooltip.y), 0, viewportHeight);
+      const rect = note.getBoundingClientRect();
+
+      let left = anchorX + offset;
+      let top = anchorY + offset;
+
+      if (left + rect.width > viewportWidth - margin) {
+        left = anchorX - rect.width - offset;
+      }
+      if (top + rect.height > viewportHeight - margin) {
+        top = anchorY - rect.height - offset;
+      }
+
+      left = clamp(left, margin, Math.max(margin, viewportWidth - rect.width - margin));
+      top = clamp(top, margin, Math.max(margin, viewportHeight - rect.height - margin));
+
+      note.style.left = `${Math.round(left)}px`;
+      note.style.top = `${Math.round(top)}px`;
+      note.style.right = 'auto';
+      note.style.bottom = 'auto';
     }
 
     document.addEventListener('mousemove', (e) => {
@@ -873,8 +951,28 @@
     });
 
     ipcRenderer.on('show-tooltip', (event, t) => {
-      log(`收到 tooltip: step ${t.step}, text=${t.text}`);
+      log(`收到 tooltip: step ${t.step}, text=${t.text}, x=${t.x}, y=${t.y}, elementIndex=${t.elementIndex}`);
       clearTooltips();
+
+      if (t?.highlight && Number.isFinite(Number(t.highlight.x)) && Number.isFinite(Number(t.highlight.y)) && Number.isFinite(Number(t.highlight.width)) && Number.isFinite(Number(t.highlight.height))) {
+        const box = document.createElement('div');
+        box.className = 'tooltip-highlight';
+        box.style.left = `${Math.round(t.highlight.x)}px`;
+        box.style.top = `${Math.round(t.highlight.y)}px`;
+        box.style.width = `${Math.max(1, Math.round(t.highlight.width))}px`;
+        box.style.height = `${Math.max(1, Math.round(t.highlight.height))}px`;
+
+        if (Number.isFinite(Number(t.highlight.index))) {
+          const label = document.createElement('div');
+          label.className = 'tooltip-highlight-label';
+          label.textContent = `#${t.highlight.index}`;
+          box.appendChild(label);
+        }
+
+        document.body.appendChild(box);
+        tooltipOverlayElements.push(box);
+        requestAnimationFrame(() => box.classList.add('visible'));
+      }
 
       const note = document.createElement('div');
       note.className = 'tooltip-note';
@@ -911,6 +1009,7 @@
       note.appendChild(actions);
 
       document.body.appendChild(note);
+      positionTooltipNote(note, t);
       tooltipElements.push(note);
 
       setTimeout(() => note.classList.add('visible'), 100);

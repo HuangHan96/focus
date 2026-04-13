@@ -31,6 +31,11 @@ MOSS_TTS_REPO_PATH=/Users/huanghan/Desktop/Projects/MOSS-TTS-Nano
 MOSS_TTS_PYTHON=/Users/huanghan/Desktop/Projects/MOSS-TTS-Nano/.venv/bin/python
 MOSS_TTS_CHECKPOINT_PATH=/Users/huanghan/.cache/huggingface/hub/models--OpenMOSS-Team--MOSS-TTS-Nano/snapshots/c3158a0fb0ff379ef79750129152b7730b5fb0f9
 MOSS_TTS_AUDIO_TOKENIZER_PATH=/Users/huanghan/.cache/huggingface/hub/models--OpenMOSS-Team--MOSS-Audio-Tokenizer-Nano/snapshots/8ee35ebff3a211e0aad01c1aa7b2076a4310440f
+
+# Optional screenshot preprocessing with OmniParser
+OMNIPARSER_REPO_PATH=/Users/huanghan/Desktop/Projects/OmniParser
+OMNIPARSER_PYTHON=python3
+OMNIPARSER_PORT=18084
 ```
 
 `TAVILY_API_KEY` is optional, but required if you want the agent to use live web search.
@@ -38,6 +43,7 @@ MOSS_TTS_AUDIO_TOKENIZER_PATH=/Users/huanghan/.cache/huggingface/hub/models--Ope
 `MOSS_TTS_AUDIO_TOKENIZER_PATH` is optional; if unset, the app will first try the local Hugging Face cache snapshot and then fall back to the remote repo id.
 `MOSS_TTS_CHECKPOINT_PATH` is also optional, but a local checkpoint path only works if that directory already contains the TTS text tokenizer files. Otherwise the app falls back to the upstream repo id so MOSS can resolve the tokenizer itself.
 The Electron app will auto-start the FastAPI TTS server and use its streaming endpoint for low-latency playback.
+If `OMNIPARSER_REPO_PATH` points to a valid OmniParser checkout with weights, the app will auto-start OmniParser and preprocess the latest full-screen screenshot before sending it to the LLM. The LLM then receives the original screenshot, the OmniParser labeled screenshot, and a compact UI element summary.
 
 ## Usage
 
@@ -55,5 +61,6 @@ Each annotation session is saved to `tmp/{task_id}/` containing:
 
 - Electron (transparent overlay, global shortcuts, screen capture)
 - OpenAI-compatible local/model endpoint with streaming
+- OmniParser for optional screenshot preprocessing and UI element extraction
 - Tavily web search tool for live lookups
 - Canvas-based drawing with hand-drawn jitter effect
