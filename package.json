@@ -1,0 +1,13 @@
+{
+  "name": "focus-mask",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "electron": "^28.0.0",
+    "marked": "^9.1.6"
+  }
+}

@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { overflow: hidden; }
+    #canvas {
+      position: fixed;
+      top: 0;
+      left: 0;
+      cursor: default;
+    }
+    #canvas.drawing {
+      cursor: crosshair;
+    }
+    #response {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      color: #e4e4e7;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      background: rgba(24, 24, 27, 0.92);
+      padding: 20px 24px;
+      border-radius: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      max-width: 520px;
+      overflow-y: auto;
+      z-index: 9999;
+      pointer-events: none;
+      display: none;
+      line-height: 1.7;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.2);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 0.3s ease, transform 0.3s ease;
+    }
+    #response p { margin: 0 0 0.5em 0; }
+    #response p:last-child { margin-bottom: 0; }
+    #response h1, #response h2, #response h3, #response h4 {
+      margin: 0.8em 0 0.4em 0;
+      font-weight: 600;
+      color: #f4f4f5;
+    }
+    #response h1 { font-size: 1.3em; }
+    #response h2 { font-size: 1.15em; }
+    #response h3 { font-size: 1.05em; }
+    #response ul, #response ol {
+      margin: 0.3em 0;
+      padding-left: 1.5em;
+    }
+    #response li { margin: 0.15em 0; }
+    #response code {
+      background: rgba(255, 255, 255, 0.1);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+      font-size: 0.9em;
+    }
+    #response pre {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 0.5em 0;
+    }
+    #response pre code {
+      background: none;
+      padding: 0;
+      font-size: 0.85em;
+      line-height: 1.5;
+    }
+    #response blockquote {
+      border-left: 3px solid rgba(255, 255, 255, 0.2);
+      margin: 0.5em 0;
+      padding: 0.2em 0 0.2em 1em;
+      color: #a1a1aa;
+    }
+    #response table {
+      border-collapse: collapse;
+      margin: 0.5em 0;
+      font-size: 0.9em;
+    }
+    #response th, #response td {
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 4px 8px;
+    }
+    #response th { background: rgba(255, 255, 255, 0.06); }
+    #response hr {
+      border: none;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      margin: 0.6em 0;
+    }
+    #response a { color: #60a5fa; text-decoration: none; }
+    #response strong { color: #f4f4f5; }
+    #response.streaming #response-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #response.visible {
+      display: block;
+      opacity: 1;
+      transform: translateY(0);
+    }
+    #response.fade-out {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    #response::-webkit-scrollbar {
+      width: 4px;
+    }
+    #response::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    #response::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 2px;
+    }
+    .response-loading {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+      color: #d4d4d8;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    #response.loading .response-loading {
+      display: flex;
+    }
+    #response-content:empty {
+      display: none;
+    }
+    .response-spinner {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(255, 255, 255, 0.18);
+      border-top-color: #60a5fa;
+      animation: response-spin 0.8s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes response-spin {
+      to { transform: rotate(360deg); }
+    }
+    #status {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      font-family: monospace;
+      font-size: 14px;
+      padding: 6px 12px;
+      border-radius: 4px;
+      z-index: 9999;
+      pointer-events: none;
+      display: none;
+    }
+    #status.drawing {
+      display: block;
+      background: rgba(255,50,50,0.9);
+      color: #fff;
+    }
+    .tooltip-note {
+      position: fixed;
+      bottom: 24px;
+      left: 24px;
+      background: rgba(24, 24, 27, 0.92);
+      color: #e4e4e7;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 10px 14px;
+      border-radius: 10px;
+      max-width: 400px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      z-index: 9998;
+      pointer-events: auto;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      opacity: 0;
+      transition: opacity 0.25s ease, transform 0.25s ease;
+      user-select: none;
+      transform: translateY(8px);
+    }
+    .tooltip-note.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .tooltip-step {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      background: #3b82f6;
+      color: #fff;
+      border-radius: 50%;
+      font-size: 11px;
+      font-weight: 600;
+      margin-right: 6px;
+      flex-shrink: 0;
+    }
+    .tooltip-content {
+      display: flex;
+      align-items: center;
+    }
+    .tooltip-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+      margin-top: 8px;
+      padding-top: 6px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .tooltip-btn {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 4px 12px;
+      border-radius: 5px;
+      border: none;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .tooltip-btn-stop {
+      background: rgba(255, 255, 255, 0.08);
+      color: #a1a1aa;
+    }
+    .tooltip-btn-stop:hover {
+      background: rgba(255, 255, 255, 0.14);
+    }
+    .tooltip-btn-next {
+      background: rgba(59, 130, 246, 0.85);
+      color: #fff;
+    }
+    .tooltip-btn-next:hover {
+      background: rgba(59, 130, 246, 1);
+    }
+    .tooltip-shortcut {
+      font-size: 10px;
+      opacity: 0.6;
+      margin-left: 4px;
+    }
+    #preview-dialog {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.95);
+      background: rgba(24, 24, 27, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 16px;
+      padding: 24px;
+      z-index: 10001;
+      width: 560px;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      display: none;
+      opacity: 0;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    #preview-dialog.visible {
+      display: block;
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+    #preview-dialog h3 {
+      color: #e4e4e7;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 14px;
+    }
+    .preview-label {
+      color: #a1a1aa;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .preview-frames {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding: 4px 0 10px;
+      margin-bottom: 12px;
+    }
+    .preview-frames::-webkit-scrollbar { height: 4px; }
+    .preview-frames::-webkit-scrollbar-track { background: transparent; }
+    .preview-frames::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+    .preview-frames img {
+      height: 72px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.1);
+      flex-shrink: 0;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .preview-frames img:hover {
+      border-color: rgba(255,255,255,0.3);
+    }
+    .preview-frames img.last-frame {
+      border-color: rgba(59, 130, 246, 0.6);
+    }
+    .preview-audio {
+      margin-bottom: 14px;
+    }
+    .preview-audio audio {
+      width: 100%;
+      height: 36px;
+      border-radius: 8px;
+    }
+    .preview-no-audio {
+      color: #52525b;
+      font-size: 12px;
+      font-family: -apple-system, sans-serif;
+      font-style: italic;
+      margin-bottom: 14px;
+    }
+    #preview-input {
+      width: 100%;
+      box-sizing: border-box;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      color: #e4e4e7;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      padding: 12px 14px;
+      outline: none;
+      resize: none;
+      line-height: 1.5;
+    }
+    #preview-input:focus { border-color: rgba(255,255,255,0.25); }
+    #preview-input::placeholder { color: rgba(255,255,255,0.3); }
+    .preview-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .preview-buttons button {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 8px 20px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .preview-btn-cancel { background: rgba(255,255,255,0.08); color: #a1a1aa; }
+    .preview-btn-cancel:hover { background: rgba(255,255,255,0.12); }
+    .preview-btn-send { background: rgba(59,130,246,0.85); color: #fff; }
+    .preview-btn-send:hover { background: rgba(59,130,246,1); }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="preview-dialog">
+    <h3>发送预览</h3>
+    <div class="preview-label">截图序列</div>
+    <div class="preview-frames" id="preview-frames"></div>
+    <div class="preview-label">录音</div>
+    <div class="preview-audio" id="preview-audio-wrap"></div>
+    <div class="preview-label">补充说明（可选）</div>
+    <textarea id="preview-input" rows="2" placeholder="描述你想问的问题..."></textarea>
+    <div class="preview-buttons">
+      <button class="preview-btn-cancel" id="preview-cancel">取消</button>
+      <button class="preview-btn-send" id="preview-send">发送</button>
+    </div>
+  </div>
+  <div id="status">● 绘画中 / 录音中</div>
+  <div id="response">
+    <div class="response-loading" id="response-loading" aria-hidden="true">
+      <span class="response-spinner"></span>
+      <span>正在等待回复...</span>
+    </div>
+    <div id="response-content"></div>
+  </div>
+  <script>
+    const { ipcRenderer } = require('electron');
+    const { marked } = require('marked');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const responseDiv = document.getElementById('response');
+    const responseContent = document.getElementById('response-content');
+    const responseLoading = document.getElementById('response-loading');
+    const statusDiv = document.getElementById('status');
+
+    marked.setOptions({ breaks: true, gfm: true });
+
+    let isDrawingMode = false;
+    let isMouseDown = false;
+    let isPreviewShown = false;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let lastX, lastY;
+    let screenshotTimer = null;
+    let pendingAudioBlob = null;
+
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    function jitter(v, amount) {
+      return v + (Math.random() - 0.5) * amount;
+    }
+
+    function log(msg) {
+      ipcRenderer.send('log', `[${new Date().toLocaleTimeString()}] ${msg}`);
+    }
+
+    function pointInElement(el, x, y) {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    }
+    window.addEventListener('resize', () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    });
+
+    // --- IPC from main ---
+    ipcRenderer.on('mode', (event, mode) => {
+      if (mode === 'drawing') {
+        isDrawingMode = true;
+        canvas.classList.add('drawing');
+        statusDiv.className = 'drawing';
+        log('进入绘画模式');
+        startRecording();
+        startScreenshots();
+      } else if (mode === 'idle') {
+        isDrawingMode = false;
+        isMouseDown = false;
+        canvas.classList.remove('drawing');
+        statusDiv.className = '';
+      }
+    });
+
+    // --- Screenshots every 333ms (3 frames per second) ---
+    function startScreenshots() {
+      ipcRenderer.send('capture-screenshot');
+      screenshotTimer = setInterval(() => {
+        if (isDrawingMode) {
+          ipcRenderer.send('capture-screenshot');
+        }
+      }, 333);
+    }
+
+    function stopScreenshots() {
+      if (screenshotTimer) {
+        clearInterval(screenshotTimer);
+        screenshotTimer = null;
+      }
+    }
+
+    // --- Detect Alt release to exit drawing mode ---
+    document.addEventListener('keyup', async (e) => {
+      if (e.key === 'Alt' && isDrawingMode) {
+        isDrawingMode = false;
+        isMouseDown = false;
+        canvas.classList.remove('drawing');
+        statusDiv.className = '';
+
+        stopScreenshots();
+        pendingAudioBlob = await stopRecording();
+
+        // Wait 333ms then capture one final full-screen screenshot
+        await new Promise(resolve => setTimeout(resolve, 333));
+        ipcRenderer.send('capture-final-screenshot');
+
+        // Small delay to let the screenshot IPC complete
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Request preview from main (don't send drawing-done yet - keep window interactive)
+        ipcRenderer.send('request-preview');
+      }
+    });
+
+    // --- Preview dialog ---
+    const previewDialog = document.getElementById('preview-dialog');
+    const previewFrames = document.getElementById('preview-frames');
+    const previewAudioWrap = document.getElementById('preview-audio-wrap');
+    const previewInput = document.getElementById('preview-input');
+    const previewSend = document.getElementById('preview-send');
+    const previewCancel = document.getElementById('preview-cancel');
+
+    ipcRenderer.on('show-preview', (event, frames) => {
+      isPreviewShown = true;
+
+      // Populate frame thumbnails
+      previewFrames.innerHTML = '';
+      frames.forEach((dataUrl, i) => {
+        const img = document.createElement('img');
+        img.src = dataUrl;
+        if (i === frames.length - 1) img.className = 'last-frame';
+        img.title = i === frames.length - 1 ? `#${i + 1} (全屏)` : `#${i + 1}`;
+        previewFrames.appendChild(img);
+      });
+      // Scroll to end
+      previewFrames.scrollLeft = previewFrames.scrollWidth;
+
+      // Audio preview
+      previewAudioWrap.innerHTML = '';
+      if (pendingAudioBlob) {
+        const audioUrl = URL.createObjectURL(pendingAudioBlob);
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.src = audioUrl;
+        previewAudioWrap.appendChild(audio);
+      } else {
+        const noAudio = document.createElement('div');
+        noAudio.className = 'preview-no-audio';
+        noAudio.textContent = '无录音';
+        previewAudioWrap.appendChild(noAudio);
+      }
+
+      previewInput.value = '';
+      previewDialog.classList.add('visible');
+      previewInput.focus();
+    });
+
+    async function doPreviewSend() {
+      const userText = previewInput.value.trim();
+      previewDialog.classList.remove('visible');
+      isPreviewShown = false;
+
+      log('发送中...');
+      const audioBase64 = await blobToBase64(pendingAudioBlob);
+      ipcRenderer.send('confirm-send', audioBase64, userText);
+      ipcRenderer.send('drawing-done');
+      pendingAudioBlob = null;
+
+      setTimeout(() => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }, 150);
+    }
+
+    function doPreviewCancel() {
+      previewDialog.classList.remove('visible');
+      isPreviewShown = false;
+      pendingAudioBlob = null;
+
+      ipcRenderer.send('cancel-send');
+      ipcRenderer.send('drawing-done');
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    previewSend.addEventListener('click', doPreviewSend);
+    previewCancel.addEventListener('click', doPreviewCancel);
+
+    previewInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        doPreviewSend();
+      } else if (e.key === 'Escape') {
+        doPreviewCancel();
+      }
+    });
+
+    // --- Audio Recording ---
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+        mediaRecorder.ondataavailable = e => {
+          if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.start();
+        log('录音开始');
+      } catch (e) {
+        log('录音失败: ' + e.message);
+      }
+    }
+
+    function stopRecording() {
+      return new Promise(resolve => {
+        if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+          resolve(null);
+          return;
+        }
+
+        mediaRecorder.onstop = () => {
+          const blob = new Blob(audioChunks, { type: 'audio/webm' });
+          mediaRecorder.stream.getTracks().forEach(t => t.stop());
+          resolve(blob.size < 1000 ? null : blob);
+        };
+
+        mediaRecorder.stop();
+      });
+    }
+
+    function blobToBase64(blob) {
+      return new Promise(resolve => {
+        if (!blob) { resolve(null); return; }
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result.split(',')[1]);
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    // --- Mouse drawing ---
+    canvas.addEventListener('mousedown', e => {
+      if (e.button === 0 && isDrawingMode) {
+        isMouseDown = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+      }
+    });
+
+    canvas.addEventListener('mousemove', e => {
+      if (isMouseDown && isDrawingMode) {
+        ctx.beginPath();
+        ctx.moveTo(jitter(lastX, 1.5), jitter(lastY, 1.5));
+        ctx.lineTo(jitter(e.clientX, 1.5), jitter(e.clientY, 1.5));
+        ctx.strokeStyle = '#ff3333';
+        ctx.lineWidth = 5;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+
+        lastX = e.clientX;
+        lastY = e.clientY;
+      }
+    });
+
+    canvas.addEventListener('mouseup', e => {
+      if (e.button === 0) {
+        isMouseDown = false;
+      }
+    });
+
+    // --- Model response ---
+    let fadeTimer = null;
+    let responseRenderTimer = null;
+    let lastResponseRenderAt = 0;
+    let streamBuffer = '';
+    let ttsAudioContext = null;
+    let ttsPlaybackId = 0;
+    let ttsScheduledTime = 0;
+    let ttsChannels = 2;
+    let ttsSampleRate = 48000;
+    const activeTtsSources = new Set();
+    const RESPONSE_RENDER_THROTTLE_MS = 80;
+    const TTS_SCHEDULE_AHEAD_SECONDS = 0.08;
+    const TTS_INITIAL_AHEAD_SECONDS = 0.12;
+
+    function ensureTtsAudioContext() {
+      if (!ttsAudioContext || ttsAudioContext.state === 'closed') {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        ttsAudioContext = new AudioContextCtor();
+      }
+      return ttsAudioContext;
+    }
+
+    async function resumeTtsAudioContext() {
+      const ctx = ensureTtsAudioContext();
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch (error) {
+          log(`TTS resume failed: ${error.message}`);
+        }
+      }
+      return ctx;
+    }
+
+    function clearTtsSources() {
+      activeTtsSources.forEach(source => {
+        try { source.stop(0); } catch {}
+      });
+      activeTtsSources.clear();
+    }
+
+    function stopTtsPlayback() {
+      clearTtsSources();
+      ttsPlaybackId = 0;
+      ttsScheduledTime = 0;
+    }
+
+    function pcm16Base64ToAudioBuffer(chunkBase64, sampleRate, channels) {
+      const bytes = Buffer.from(chunkBase64, 'base64');
+      const sampleCount = Math.floor(bytes.byteLength / 2);
+      const interleaved = new Int16Array(bytes.buffer, bytes.byteOffset, sampleCount);
+      const frameCount = Math.floor(interleaved.length / channels);
+      const ctx = ensureTtsAudioContext();
+      const audioBuffer = ctx.createBuffer(channels, frameCount, sampleRate);
+
+      for (let channel = 0; channel < channels; channel++) {
+        const channelData = audioBuffer.getChannelData(channel);
+        for (let frame = 0; frame < frameCount; frame++) {
+          const index = frame * channels + channel;
+          channelData[frame] = interleaved[index] / 32768;
+        }
+      }
+
+      return audioBuffer;
+    }
+
+    async function scheduleTtsChunk(chunkBase64) {
+      if (!chunkBase64 || !ttsPlaybackId) return;
+
+      const ctx = await resumeTtsAudioContext();
+      const audioBuffer = pcm16Base64ToAudioBuffer(chunkBase64, ttsSampleRate, ttsChannels);
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      source.onended = () => activeTtsSources.delete(source);
+      activeTtsSources.add(source);
+
+      const startAt = Math.max(ctx.currentTime + TTS_SCHEDULE_AHEAD_SECONDS, ttsScheduledTime || 0);
+      source.start(startAt);
+      ttsScheduledTime = startAt + audioBuffer.duration;
+    }
+
+    function renderResponseMarkdown(text) {
+      responseContent.innerHTML = marked.parse(text || '');
+      responseDiv.scrollTop = responseDiv.scrollHeight;
+      lastResponseRenderAt = performance.now();
+    }
+
+    function renderResponseStreamingText(text) {
+      responseContent.textContent = text || '';
+      responseDiv.scrollTop = responseDiv.scrollHeight;
+      lastResponseRenderAt = performance.now();
+    }
+
+    function scheduleResponseRender(force = false) {
+      if (force) {
+        if (responseRenderTimer) {
+          clearTimeout(responseRenderTimer);
+          responseRenderTimer = null;
+        }
+        renderResponseMarkdown(streamBuffer.trim());
+        return;
+      }
+
+      if (responseRenderTimer) return;
+
+      const elapsed = performance.now() - lastResponseRenderAt;
+      const delay = Math.max(0, RESPONSE_RENDER_THROTTLE_MS - elapsed);
+      responseRenderTimer = setTimeout(() => {
+        responseRenderTimer = null;
+        renderResponseStreamingText(streamBuffer.trim());
+      }, delay);
+    }
+
+    function showResponse() {
+      responseDiv.classList.remove('fade-out');
+      responseDiv.classList.add('visible');
+    }
+
+    function hasResponseContent() {
+      return Boolean(responseContent.textContent.trim());
+    }
+
+    function setResponseLoading(isLoading) {
+      responseDiv.classList.toggle('loading', isLoading);
+      responseDiv.classList.toggle('streaming', isLoading);
+      responseLoading.setAttribute('aria-hidden', String(!isLoading));
+
+      if (isLoading) {
+        showResponse();
+      } else if (!hasResponseContent()) {
+        responseDiv.classList.remove('visible', 'fade-out');
+      }
+    }
+
+    function scheduleResponseFade() {
+      fadeTimer = setTimeout(() => {
+        responseDiv.classList.add('fade-out');
+        setTimeout(() => {
+          responseDiv.classList.remove('visible', 'fade-out', 'loading');
+          responseLoading.setAttribute('aria-hidden', 'true');
+          responseContent.textContent = '';
+        }, 300);
+      }, 30000);
+    }
+
+    ipcRenderer.on('model-loading', (event, isLoading) => {
+      if (isLoading) {
+        if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
+        if (responseRenderTimer) { clearTimeout(responseRenderTimer); responseRenderTimer = null; }
+        streamBuffer = '';
+        responseContent.textContent = '';
+        stopTtsPlayback();
+      }
+
+      setResponseLoading(isLoading);
+    });
+
+    ipcRenderer.on('model-stream', (event, text) => {
+      if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
+      showResponse();
+      setResponseLoading(true);
+
+      streamBuffer += text;
+      scheduleResponseRender(false);
+    });
+
+    ipcRenderer.on('model-done', (event, cleanText) => {
+      streamBuffer = cleanText;
+      showResponse();
+      scheduleResponseRender(true);
+      setResponseLoading(false);
+      scheduleResponseFade();
+    });
+
+    ipcRenderer.on('model-error', (event, message) => {
+      streamBuffer = message || '请求失败，请重试。';
+      showResponse();
+      scheduleResponseRender(true);
+      setResponseLoading(false);
+      scheduleResponseFade();
+    });
+
+    ipcRenderer.on('tts-start', async (event, payload) => {
+      stopTtsPlayback();
+      ttsPlaybackId = payload?.id || 0;
+      ttsSampleRate = payload?.sampleRate || 48000;
+      ttsChannels = payload?.channels || 2;
+      const ctx = await resumeTtsAudioContext();
+      ttsScheduledTime = ctx.currentTime + TTS_INITIAL_AHEAD_SECONDS;
+    });
+
+    ipcRenderer.on('tts-chunk', async (event, payload) => {
+      if (!payload || payload.id !== ttsPlaybackId) return;
+      try {
+        await scheduleTtsChunk(payload.chunkBase64);
+      } catch (error) {
+        log(`TTS chunk playback failed: ${error.message}`);
+      }
+    });
+
+    ipcRenderer.on('tts-end', (event, payload) => {
+      if (!payload || payload.id !== ttsPlaybackId) return;
+    });
+
+    ipcRenderer.on('tts-stop', () => {
+      stopTtsPlayback();
+    });
+
+    ipcRenderer.on('tts-error', (event, payload) => {
+      log(`TTS error: ${payload?.message || 'unknown error'}`);
+    });
+
+    // --- Tooltips & Arrows ---
+    let tooltipElements = [];
+
+    function clearTooltips() {
+      tooltipElements.forEach(el => el.remove());
+      tooltipElements = [];
+    }
+
+    document.addEventListener('mousemove', (e) => {
+      if (isDrawingMode || isPreviewShown) return;
+      const over = tooltipElements.some(el => pointInElement(el, e.clientX, e.clientY));
+      if (over) {
+        ipcRenderer.send('set-interactive');
+      } else {
+        ipcRenderer.send('set-passthrough');
+      }
+    });
+
+    ipcRenderer.on('show-tooltip', (event, t) => {
+      log(`收到 tooltip: step ${t.step}, text=${t.text}`);
+      clearTooltips();
+
+      const note = document.createElement('div');
+      note.className = 'tooltip-note';
+
+      // Content wrapper with step number
+      const contentWrap = document.createElement('div');
+      contentWrap.className = 'tooltip-content';
+
+      const stepBadge = document.createElement('span');
+      stepBadge.className = 'tooltip-step';
+      stepBadge.textContent = String(t.step);
+      contentWrap.appendChild(stepBadge);
+
+      const text = document.createElement('span');
+      text.textContent = t.text;
+      contentWrap.appendChild(text);
+      note.appendChild(contentWrap);
+
+      // Action buttons: Stop / Next
+      const actions = document.createElement('div');
+      actions.className = 'tooltip-actions';
+
+      const stopBtn = document.createElement('button');
+      stopBtn.className = 'tooltip-btn tooltip-btn-stop';
+      stopBtn.textContent = 'Stop';
+      stopBtn.addEventListener('click', doStopSteps);
+      actions.appendChild(stopBtn);
+
+      const nextBtn = document.createElement('button');
+      nextBtn.className = 'tooltip-btn tooltip-btn-next';
+      nextBtn.innerHTML = 'Next <span class="tooltip-shortcut">⌥→</span>';
+      nextBtn.addEventListener('click', doNextStep);
+      actions.appendChild(nextBtn);
+      note.appendChild(actions);
+
+      document.body.appendChild(note);
+      tooltipElements.push(note);
+
+      setTimeout(() => note.classList.add('visible'), 100);
+    });
+
+    function doNextStep() {
+      clearTooltips();
+      ipcRenderer.send('set-passthrough');
+      setTimeout(() => ipcRenderer.send('next-step'), 200);
+    }
+
+    function doStopSteps() {
+      clearTooltips();
+      ipcRenderer.send('stop-steps');
+      ipcRenderer.send('set-passthrough');
+    }
+
+    // Option+→ shortcut for Next (via global shortcut from main process)
+    ipcRenderer.on('trigger-next', () => {
+      if (tooltipElements.length > 0) {
+        doNextStep();
+      }
+    });
+
+    // --- Control Mode ---
+  </script>
+</body>
+</html>
