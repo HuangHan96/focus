@@ -1,13 +1,13 @@
-const { app, BrowserWindow, screen, desktopCapturer, ipcMain, globalShortcut } = require('electron');
+const { app, BrowserWindow, screen, desktopCapturer, ipcMain, globalShortcut, nativeImage } = require('electron');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 require('dotenv').config();
 
-const LLM_BASE = process.env.LLM_BASE || 'http://127.0.0.1:1234/v1';
-const LLM_MODEL = process.env.LLM_MODEL || 'qwen/qwen3.5-9b';
-const LLM_API_KEY = process.env.LLM_API_KEY || 'lm-studio';
+const LLM_BASE = process.env.LLM_BASE || 'http://54.219.66.60:3000/v1';
+const LLM_MODEL = process.env.LLM_MODEL || 'gpt-5.4';
+const LLM_API_KEY = process.env.LLM_API_KEY || 'sk-Q8fv7Pdn1xGMCRsBawXvUlU4jY3sHSetRkAUP6MeI8L0iiqn';
 const TAVILY_BASE = process.env.TAVILY_BASE || 'https://api.tavily.com/search';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 const MAX_TOOL_ROUNDS = 4;
@@ -17,9 +17,12 @@ const TTS_PORT = Number.parseInt(process.env.MOSS_TTS_PORT || '18083', 10);
 const TTS_BASE = `http://${TTS_HOST}:${TTS_PORT}`;
 const TTS_HEALTH_TIMEOUT_MS = 90_000;
 const TTS_REQUEST_TIMEOUT_MS = 30_000;
-const TTS_STREAM_MIN_CHARS = 18;
-const TTS_STREAM_SOFT_CHARS = 36;
-const TTS_STREAM_MAX_CHARS = 120;
+const TTS_STREAM_MIN_CHARS = 24;
+const TTS_STREAM_SOFT_CHARS = 64;
+const TTS_STREAM_MAX_CHARS = 180;
+const TTS_STREAM_HARD_MAX_CHARS = 320;
+const TTS_IPC_CHUNK_FLUSH_BYTES = 24 * 1024;
+const TTS_IPC_CHUNK_FLUSH_MS = 90;
 const TTS_PYTHON = process.env.MOSS_TTS_PYTHON || path.join(TTS_REPO_PATH, '.venv', 'bin', 'python');
 const TTS_DEMO_METADATA_PATH = path.join(TTS_REPO_PATH, 'assets', 'demo.jsonl');
 const TTS_HF_HOME = process.env.MOSS_TTS_HF_HOME || path.join(__dirname, '.cache', 'moss-huggingface');
@@ -37,9 +40,18 @@ const OMNIPARSER_REQUEST_TIMEOUT_MS = 90_000;
 const OMNIPARSER_SOM_MODEL_PATH = process.env.OMNIPARSER_SOM_MODEL_PATH || path.join(OMNIPARSER_REPO_PATH, 'weights', 'icon_detect', 'model.pt');
 const OMNIPARSER_CAPTION_MODEL_NAME = process.env.OMNIPARSER_CAPTION_MODEL_NAME || 'florence2';
 const OMNIPARSER_CAPTION_MODEL_PATH = process.env.OMNIPARSER_CAPTION_MODEL_PATH || path.join(OMNIPARSER_REPO_PATH, 'weights', 'icon_caption_florence');
-const OMNIPARSER_DEVICE = process.env.OMNIPARSER_DEVICE || '';
+const OMNIPARSER_DEVICE = process.env.OMNIPARSER_DEVICE || 'auto';
 const OMNIPARSER_BOX_THRESHOLD = process.env.OMNIPARSER_BOX_THRESHOLD || '0.05';
+const OMNIPARSER_OCR_BACKEND = process.env.OMNIPARSER_OCR_BACKEND || (process.platform === 'darwin' ? 'vision' : 'easyocr');
+const OMNIPARSER_OCR_LANGS = process.env.OMNIPARSER_OCR_LANGS || 'ch_sim,en';
 const OMNIPARSER_MAX_ELEMENTS = clampEnvInt(process.env.OMNIPARSER_MAX_ELEMENTS, 120);
+const IMAGE_MAX_WIDTH = clampEnvInt(process.env.IMAGE_MAX_WIDTH, 1920);
+const IMAGE_MAX_HEIGHT = clampEnvInt(process.env.IMAGE_MAX_HEIGHT, 1080);
+const IMAGE_JPEG_QUALITY = clampEnvInt(process.env.IMAGE_JPEG_QUALITY, 80);
+const OMNIPARSER_INPUT_MAX_WIDTH = clampEnvInt(process.env.OMNIPARSER_INPUT_MAX_WIDTH, 1920);
+const OMNIPARSER_INPUT_MAX_HEIGHT = clampEnvInt(process.env.OMNIPARSER_INPUT_MAX_HEIGHT, 1080);
+const OMNIPARSER_INPUT_JPEG_QUALITY = clampEnvInt(process.env.OMNIPARSER_INPUT_JPEG_QUALITY, 68);
+const OMNIPARSER_IMAGE_JPEG_QUALITY = clampEnvInt(process.env.OMNIPARSER_IMAGE_JPEG_QUALITY, 72);
 const HF_CACHE_DIR = path.join(os.homedir(), '.cache', 'huggingface', 'hub');
 
 // 是否发送绘画过程中的截图序列，关闭后只发送最后一张完整截图
@@ -109,6 +121,7 @@ let screenWidth, screenHeight;
 let overlayOffsetX = 0;
 let overlayOffsetY = 0;
 let screenshots = [];
+let currentRawScreenshotDataUrl = '';
 let taskCounter = 0;
 let conversationHistory = [];
 const MAX_HISTORY = 10;
@@ -119,6 +132,11 @@ let ttsReadyPromise = null;
 let omniParserProcess = null;
 let omniParserReadyPromise = null;
 let latestOmniParserElements = [];
+let pendingPreviewOmniContext = null;
+let pendingPreviewOmniContextPromise = null;
+let pendingPreviewOmniFrameDataUrl = '';
+let previewSequence = 0;
+let llmCallCounter = 0;
 let activeTtsSession = null;
 let ttsPlaybackRunId = 0;
 const resolvedLocalTtsCheckpointPath = resolveCachedSnapshotPath('OpenMOSS-Team/MOSS-TTS-Nano');
@@ -314,7 +332,9 @@ function spawnOmniParserService() {
     '--som_model_path', OMNIPARSER_SOM_MODEL_PATH,
     '--caption_model_name', OMNIPARSER_CAPTION_MODEL_NAME,
     '--caption_model_path', OMNIPARSER_CAPTION_MODEL_PATH,
-    '--BOX_TRESHOLD', String(OMNIPARSER_BOX_THRESHOLD)
+    '--BOX_TRESHOLD', String(OMNIPARSER_BOX_THRESHOLD),
+    '--ocr_backend', OMNIPARSER_OCR_BACKEND,
+    '--ocr_langs', OMNIPARSER_OCR_LANGS
   ];
 
   if (OMNIPARSER_DEVICE) {
@@ -398,8 +418,56 @@ function imageDataUrlToBase64(dataUrl) {
   return match ? match[1] : String(dataUrl || '');
 }
 
-function summarizeOmniParserElements(elements, imageWidth, imageHeight, limit = OMNIPARSER_MAX_ELEMENTS) {
-  const list = Array.isArray(elements) ? elements.slice(0, limit) : [];
+function fitImageSize(width, height, maxWidth = IMAGE_MAX_WIDTH, maxHeight = IMAGE_MAX_HEIGHT) {
+  const sourceWidth = Math.max(1, Math.round(Number(width) || 0));
+  const sourceHeight = Math.max(1, Math.round(Number(height) || 0));
+  const scale = Math.min(1, maxWidth / sourceWidth, maxHeight / sourceHeight);
+  return {
+    width: Math.max(1, Math.round(sourceWidth * scale)),
+    height: Math.max(1, Math.round(sourceHeight * scale))
+  };
+}
+
+function convertImageDataUrlToJpeg(dataUrl, quality = OMNIPARSER_IMAGE_JPEG_QUALITY) {
+  return convertImageDataUrlToSizedJpeg(dataUrl, {
+    maxWidth: IMAGE_MAX_WIDTH,
+    maxHeight: IMAGE_MAX_HEIGHT,
+    quality
+  });
+}
+
+function convertImageDataUrlToSizedJpeg(dataUrl, options = {}) {
+  const {
+    maxWidth = IMAGE_MAX_WIDTH,
+    maxHeight = IMAGE_MAX_HEIGHT,
+    quality = OMNIPARSER_IMAGE_JPEG_QUALITY
+  } = options;
+  const normalized = normalizeImageDataUrl(dataUrl);
+  if (!normalized) return '';
+  const image = nativeImage.createFromDataURL(normalized);
+  if (image.isEmpty()) return normalized;
+  const sourceSize = image.getSize();
+  const targetSize = fitImageSize(sourceSize.width, sourceSize.height, maxWidth, maxHeight);
+  const resizedImage = (targetSize.width !== sourceSize.width || targetSize.height !== sourceSize.height)
+    ? image.resize({ width: targetSize.width, height: targetSize.height, quality: 'good' })
+    : image;
+  const jpegQuality = Math.max(1, Math.min(100, Number.parseInt(String(quality), 10) || 72));
+  const jpegBuffer = resizedImage.toJPEG(jpegQuality);
+  return `data:image/jpeg;base64,${jpegBuffer.toString('base64')}`;
+}
+
+function getImageDataUrlSize(dataUrl) {
+  const normalized = normalizeImageDataUrl(dataUrl);
+  if (!normalized) return { width: 0, height: 0 };
+  const image = nativeImage.createFromDataURL(normalized);
+  if (image.isEmpty()) return { width: 0, height: 0 };
+  return image.getSize();
+}
+
+function summarizeOmniParserElements(elements, imageWidth, imageHeight, options = {}) {
+  const { limit = null, truncateContent = null } = options || {};
+  const sourceList = Array.isArray(elements) ? elements : [];
+  const list = Number.isFinite(limit) && limit > 0 ? sourceList.slice(0, limit) : sourceList;
   const lines = list.map((element, index) => {
     const bbox = Array.isArray(element?.bbox) ? element.bbox : [];
     const x1 = Math.round(Number(bbox[0] || 0) * imageWidth);
@@ -408,12 +476,15 @@ function summarizeOmniParserElements(elements, imageWidth, imageHeight, limit = 
     const y2 = Math.round(Number(bbox[3] || 0) * imageHeight);
     const type = element?.type || 'unknown';
     const interactive = element?.interactivity ? 'interactive' : 'static';
-    const content = sanitizeTextForTts(String(element?.content || '').trim()).slice(0, 180);
+    const normalizedContent = sanitizeTextForTts(String(element?.content || '').trim());
+    const content = Number.isFinite(truncateContent) && truncateContent > 0
+      ? normalizedContent.slice(0, truncateContent)
+      : normalizedContent;
     return `${index}: type=${type}, ${interactive}, bbox=[${x1},${y1},${x2},${y2}], content="${content}"`;
   }).filter(Boolean);
 
-  if (Array.isArray(elements) && elements.length > list.length) {
-    lines.push(`... ${elements.length - list.length} more elements omitted`);
+  if (sourceList.length > list.length) {
+    lines.push(`... ${sourceList.length - list.length} more elements omitted`);
   }
 
   return lines.join('\n');
@@ -532,13 +603,17 @@ async function preprocessScreenshotWithOmniParser(frameDataUrl) {
   await ensureOmniParserReady();
 
   const normalizedDataUrl = normalizeImageDataUrl(frameDataUrl);
+  const inputSize = getImageDataUrlSize(normalizedDataUrl);
+  const inputBase64 = imageDataUrlToBase64(normalizedDataUrl);
+  const approxInputBytes = Buffer.byteLength(inputBase64, 'base64');
+  console.log(`OmniParser 输入截图: ${inputSize.width}x${inputSize.height}, ~${Math.round(approxInputBytes / 1024)}KB`);
   const response = await fetchWithTimeout(`${OMNIPARSER_BASE}/parse/`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      base64_image: imageDataUrlToBase64(normalizedDataUrl)
+      base64_image: inputBase64
     })
   }, OMNIPARSER_REQUEST_TIMEOUT_MS);
 
@@ -550,12 +625,116 @@ async function preprocessScreenshotWithOmniParser(frameDataUrl) {
   const payload = await response.json();
   const parsedImageBase64 = String(payload?.som_image_base64 || '').trim();
   const parsedElements = Array.isArray(payload?.parsed_content_list) ? payload.parsed_content_list : [];
+  const parsedImageDataUrl = parsedImageBase64 ? `data:image/png;base64,${parsedImageBase64}` : '';
 
   return {
-    parsedImageDataUrl: parsedImageBase64 ? `data:image/png;base64,${parsedImageBase64}` : '',
+    parsedImageDataUrl: parsedImageDataUrl ? convertImageDataUrlToJpeg(parsedImageDataUrl) : '',
     parsedElements,
     latency: payload?.latency || null
   };
+}
+
+async function buildOmniParserContext(frameDataUrl, omniSourceFrameDataUrl = '') {
+  const normalizedFrame = normalizeImageDataUrl(frameDataUrl);
+  const normalizedOmniSourceFrame = omniSourceFrameDataUrl
+    ? normalizeImageDataUrl(omniSourceFrameDataUrl)
+    : normalizedFrame;
+  const omniResult = await preprocessScreenshotWithOmniParser(normalizedOmniSourceFrame);
+  const parsedSummary = summarizeOmniParserElements(omniResult.parsedElements, screenWidth, screenHeight);
+  const omniParserSummary = parsedSummary
+    ? `OmniParser detected UI elements on the current screen. Use this as extra grounding context, but verify against the screenshot.\n${parsedSummary}`
+    : '';
+
+  return {
+    frameDataUrl: normalizedFrame,
+    omniSourceFrameDataUrl: normalizedOmniSourceFrame,
+    omniResult,
+    omniParserImageDataUrl: omniResult.parsedImageDataUrl || '',
+    omniParserSummary
+  };
+}
+
+function primePreviewOmniParserContext(frameDataUrl, omniSourceFrameDataUrl = '') {
+  const normalizedFrame = normalizeImageDataUrl(frameDataUrl);
+  pendingPreviewOmniFrameDataUrl = normalizedFrame;
+  pendingPreviewOmniContext = null;
+  pendingPreviewOmniContextPromise = buildOmniParserContext(normalizedFrame, omniSourceFrameDataUrl || normalizedFrame)
+    .then(context => {
+      if (context.frameDataUrl === pendingPreviewOmniFrameDataUrl) {
+        pendingPreviewOmniContext = context;
+      }
+      return context;
+    })
+    .catch(error => {
+      pendingPreviewOmniContext = null;
+      throw error;
+    });
+  return pendingPreviewOmniContextPromise;
+}
+
+function invalidatePendingPreviewOmniContext() {
+  pendingPreviewOmniContext = null;
+  pendingPreviewOmniContextPromise = null;
+  pendingPreviewOmniFrameDataUrl = '';
+}
+
+function pushPreviewWindow(frames, previewId, omniSourceFrameDataUrl = '') {
+  const primaryFrame = frames[0] ? normalizeImageDataUrl(frames[0]) : '';
+  const primaryOmniSourceFrame = omniSourceFrameDataUrl
+    ? normalizeImageDataUrl(omniSourceFrameDataUrl)
+    : primaryFrame;
+  maskWindow.webContents.send('show-preview', {
+    frames,
+    previewId,
+    omniParserImageDataUrl: pendingPreviewOmniContext?.frameDataUrl === primaryFrame
+      ? pendingPreviewOmniContext.omniParserImageDataUrl
+      : ''
+  });
+
+  if (!primaryFrame) {
+    invalidatePendingPreviewOmniContext();
+    return;
+  }
+
+  if (!isOmniParserConfigured()) {
+    invalidatePendingPreviewOmniContext();
+    return;
+  }
+
+  const updatePreviewOmniParser = async () => {
+    try {
+      if (pendingPreviewOmniContext?.frameDataUrl === primaryFrame) {
+        if (previewId === previewSequence) {
+          maskWindow.webContents.send('preview-omniparser', {
+            frames,
+            previewId,
+            omniParserImageDataUrl: pendingPreviewOmniContext.omniParserImageDataUrl
+          });
+        }
+        return;
+      }
+
+      const omniContext = pendingPreviewOmniContextPromise && pendingPreviewOmniFrameDataUrl === primaryFrame
+        ? await pendingPreviewOmniContextPromise
+        : await primePreviewOmniParserContext(primaryFrame, primaryOmniSourceFrame);
+
+      if (previewId === previewSequence && omniContext?.frameDataUrl === primaryFrame) {
+        pendingPreviewOmniContext = omniContext;
+        maskWindow.webContents.send('preview-omniparser', {
+          frames,
+          previewId,
+          omniParserImageDataUrl: omniContext.omniParserImageDataUrl
+        });
+      }
+    } catch (error) {
+      if (previewId === previewSequence) {
+        invalidatePendingPreviewOmniContext();
+      }
+      console.warn('预览 OmniParser 预处理失败，回退到原始截图:', error.message);
+    }
+  };
+
+  void updatePreviewOmniParser();
 }
 
 async function isTtsServiceHealthy() {
@@ -770,7 +949,7 @@ function extractQueuedTtsSegments(text, force = false) {
       }
 
       const candidateLength = sanitizeTtsQueueText(rawText.slice(start, index + 1)).length;
-      if (candidateLength >= TTS_STREAM_MAX_CHARS) {
+      if (force && candidateLength >= TTS_STREAM_MAX_CHARS) {
         splitIndex = strongBoundary > start
           ? strongBoundary
           : weakBoundary > start
@@ -779,8 +958,12 @@ function extractQueuedTtsSegments(text, force = false) {
         break;
       }
 
-      if (candidateLength >= TTS_STREAM_SOFT_CHARS && strongBoundary > start) {
-        splitIndex = strongBoundary;
+      if (!force && candidateLength >= TTS_STREAM_HARD_MAX_CHARS) {
+        splitIndex = strongBoundary > start
+          ? strongBoundary
+          : weakBoundary > start
+            ? weakBoundary
+            : index + 1;
         break;
       }
     }
@@ -814,6 +997,36 @@ async function streamTtsSegment(session, text) {
   const abortController = new AbortController();
   let streamId = null;
   session.currentAbortController = abortController;
+  let pendingAudioBuffers = [];
+  let pendingAudioBytes = 0;
+  let flushTimer = null;
+
+  const clearFlushTimer = () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+  };
+
+  const flushAudioChunks = () => {
+    clearFlushTimer();
+    if (!pendingAudioBytes || !maskWindow || maskWindow.isDestroyed()) return;
+    const chunkBase64 = Buffer.concat(pendingAudioBuffers, pendingAudioBytes).toString('base64');
+    pendingAudioBuffers = [];
+    pendingAudioBytes = 0;
+    maskWindow.webContents.send('tts-chunk', {
+      id: session.id,
+      chunkBase64
+    });
+  };
+
+  const scheduleFlush = () => {
+    if (flushTimer || !pendingAudioBytes) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      flushAudioChunks();
+    }, TTS_IPC_CHUNK_FLUSH_MS);
+  };
 
   try {
     await ensureTtsServiceReady();
@@ -877,12 +1090,17 @@ async function streamTtsSegment(session, text) {
       if (abortController.signal.aborted || session.cancelled || activeTtsSession !== session) break;
 
       if (maskWindow && !maskWindow.isDestroyed()) {
-        maskWindow.webContents.send('tts-chunk', {
-          id: session.id,
-          chunkBase64: Buffer.from(value).toString('base64')
-        });
+        pendingAudioBuffers.push(Buffer.from(value));
+        pendingAudioBytes += value.length;
+        if (pendingAudioBytes >= TTS_IPC_CHUNK_FLUSH_BYTES) {
+          flushAudioChunks();
+        } else {
+          scheduleFlush();
+        }
       }
     }
+
+    flushAudioChunks();
   } catch (error) {
     if (!abortController.signal.aborted && !session.cancelled) {
       console.error('TTS 播放失败:', error.message);
@@ -891,6 +1109,8 @@ async function streamTtsSegment(session, text) {
       }
     }
   } finally {
+    clearFlushTimer();
+    flushAudioChunks();
     if (session.currentAbortController === abortController) {
       session.currentAbortController = null;
     }
@@ -1032,6 +1252,7 @@ async function createMaskWindow() {
 
   globalShortcut.register('Alt+D', () => {
     screenshots = [];
+    currentRawScreenshotDataUrl = '';
     maskWindow.setIgnoreMouseEvents(false);
     maskWindow.focus();
     maskWindow.webContents.send('mode', 'drawing');
@@ -1050,33 +1271,39 @@ async function createMaskWindow() {
   ipcMain.on('set-interactive', () => maskWindow.setIgnoreMouseEvents(false));
   ipcMain.on('set-passthrough', () => maskWindow.setIgnoreMouseEvents(true, { forward: true }));
 
-  ipcMain.on('capture-screenshot', async () => {
-    try {
-      const dataUrl = await captureScreenJpeg();
-      screenshots.push(dataUrl);
-      console.log(`截图 #${screenshots.length}`);
-    } catch (e) { console.error('截图失败:', e.message); }
-  });
-
   ipcMain.on('capture-final-screenshot', async () => {
     try {
-      const dataUrl = await captureFullScreenJpeg();
-      screenshots.push(dataUrl);
-      console.log(`全屏截图 #${screenshots.length} (final)`);
+      const { rawDataUrl, previewDataUrl } = await captureFullScreenDataUrls();
+      screenshots = [previewDataUrl];
+      currentRawScreenshotDataUrl = rawDataUrl;
+      console.log('全屏截图已更新');
+      const previewId = ++previewSequence;
+      pushPreviewWindow([previewDataUrl], previewId, rawDataUrl);
     } catch (e) { console.error('全屏截图失败:', e.message); }
   });
 
-  ipcMain.on('request-preview', () => maskWindow.webContents.send('show-preview', screenshots));
+  ipcMain.on('request-preview', async () => {
+    const frames = screenshots.slice(-1);
+    const previewId = ++previewSequence;
+    pushPreviewWindow(frames, previewId, currentRawScreenshotDataUrl);
+  });
 
   ipcMain.on('confirm-send', async (event, audioBase64, userText) => {
     try {
       const frames = [...screenshots];
+      const rawScreenshotDataUrl = currentRawScreenshotDataUrl;
       screenshots = [];
+      previewSequence += 1;
+      const previewOmniContext = pendingPreviewOmniContextPromise && pendingPreviewOmniFrameDataUrl === (frames[0] ? normalizeImageDataUrl(frames[0]) : '')
+        ? await pendingPreviewOmniContextPromise.catch(() => null)
+        : pendingPreviewOmniContext;
+      invalidatePendingPreviewOmniContext();
+      currentRawScreenshotDataUrl = '';
       console.log(`调用模型... (${frames.length} 帧)`);
       stopTtsPlayback();
       setModelLoading(true);
       saveDebugData(frames, audioBase64);
-      await sendToModel(frames, audioBase64, userText);
+      await sendToModel(frames, audioBase64, userText, previewOmniContext, rawScreenshotDataUrl);
     } catch (error) {
       console.error('错误:', error.message);
       sendModelError(`请求失败，请重试。\n\n\`${error.message}\``);
@@ -1084,7 +1311,13 @@ async function createMaskWindow() {
     }
   });
 
-  ipcMain.on('cancel-send', () => { screenshots = []; console.log('用户取消发送'); });
+  ipcMain.on('cancel-send', () => {
+    screenshots = [];
+    currentRawScreenshotDataUrl = '';
+    previewSequence += 1;
+    invalidatePendingPreviewOmniContext();
+    console.log('用户取消发送');
+  });
   ipcMain.on('log', (event, msg) => console.log(msg));
 
   ipcMain.on('next-step', async () => {
@@ -1092,8 +1325,8 @@ async function createMaskWindow() {
       console.log('用户点击下一步，截图并继续...');
       stopTtsPlayback();
       setModelLoading(true);
-      const dataUrl = await captureFullScreenJpeg();
-      await continueStep(dataUrl);
+      const { rawDataUrl, previewDataUrl } = await captureFullScreenDataUrls();
+      await continueStep(previewDataUrl, rawDataUrl);
     } catch (error) {
       console.error('下一步错误:', error.message);
       sendModelError(`请求失败，请重试。\n\n\`${error.message}\``);
@@ -1135,42 +1368,25 @@ async function captureScreenJpeg() {
   let x = Math.max(0, Math.min(cx - Math.round(cw / 2), fullW - cw));
   let y = Math.max(0, Math.min(cy - Math.round(ch / 2), fullH - ch));
   const cropped = fullImage.crop({ x, y, width: cw, height: ch });
-  const pngDataUrl = cropped.toDataURL();
-  const jsCode = `
-    new Promise(resolve => {
-      const img = new Image();
-      img.onload = () => {
-        const c = document.createElement('canvas');
-        c.width = ${CROP_W}; c.height = ${CROP_H};
-        c.getContext('2d').drawImage(img, 0, 0, ${CROP_W}, ${CROP_H});
-        resolve(c.toDataURL('image/jpeg', 0.8));
-      };
-      img.src = ${JSON.stringify(pngDataUrl)};
-    })
-  `;
-  return maskWindow.webContents.executeJavaScript(jsCode);
+  return convertImageDataUrlToJpeg(cropped.toDataURL(), IMAGE_JPEG_QUALITY);
 }
 
 
-async function captureFullScreenJpeg() {
+async function captureFullScreenDataUrls() {
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
     thumbnailSize: { width: screenWidth, height: screenHeight }
   });
-  const pngDataUrl = sources[0].thumbnail.toDataURL();
-  const jsCode = `
-    new Promise(resolve => {
-      const img = new Image();
-      img.onload = () => {
-        const c = document.createElement('canvas');
-        c.width = img.width; c.height = img.height;
-        c.getContext('2d').drawImage(img, 0, 0);
-        resolve(c.toDataURL('image/jpeg', 0.8));
-      };
-      img.src = ${JSON.stringify(pngDataUrl)};
-    })
-  `;
-  return maskWindow.webContents.executeJavaScript(jsCode);
+  const rawDataUrl = sources[0].thumbnail.toDataURL();
+  return {
+    rawDataUrl,
+    previewDataUrl: convertImageDataUrlToJpeg(rawDataUrl, IMAGE_JPEG_QUALITY)
+  };
+}
+
+async function captureFullScreenJpeg() {
+  const { previewDataUrl } = await captureFullScreenDataUrls();
+  return previewDataUrl;
 }
 
 let debugDir = null;
@@ -1189,6 +1405,67 @@ function saveDebugData(frames, audioBase64) {
   console.log(`调试数据已保存: tmp/${taskId}/ (${frames.length} 帧)`);
 }
 
+function trimDebugText(text, limit = 4000) {
+  const value = String(text || '');
+  return value.length > limit ? `${value.slice(0, limit)}...` : value;
+}
+
+function summarizeMessageContentForDebug(content) {
+  if (typeof content === 'string') {
+    return {
+      kind: 'text',
+      text_length: content.length,
+      preview: trimDebugText(content, 800)
+    };
+  }
+
+  if (!Array.isArray(content)) {
+    return {
+      kind: typeof content,
+      preview: trimDebugText(JSON.stringify(content), 800)
+    };
+  }
+
+  return content.map(item => {
+    if (item?.type === 'text') {
+      return {
+        type: 'text',
+        text_length: String(item.text || '').length,
+        preview: trimDebugText(item.text || '', 400)
+      };
+    }
+    if (item?.type === 'image_url') {
+      const url = typeof item?.image_url?.url === 'string' ? item.image_url.url : '';
+      return {
+        type: 'image_url',
+        media_type: url.startsWith('data:') ? url.slice(5, url.indexOf(';')) : 'remote',
+        url_length: url.length
+      };
+    }
+    return {
+      type: item?.type || 'unknown',
+      preview: trimDebugText(JSON.stringify(item), 300)
+    };
+  });
+}
+
+function writeLlmDebugArtifact(filename, content, encoding = 'utf-8') {
+  if (!debugDir) return null;
+  try {
+    fs.mkdirSync(debugDir, { recursive: true });
+    const filePath = path.join(debugDir, filename);
+    fs.writeFileSync(filePath, content, encoding);
+    return filePath;
+  } catch (error) {
+    console.warn(`写入 LLM 调试文件失败(${filename}):`, error.message);
+    return null;
+  }
+}
+
+function writeLlmDebugJson(filename, payload) {
+  return writeLlmDebugArtifact(filename, JSON.stringify(payload, null, 2));
+}
+
 function writeImageDataUrlToFile(dataUrl, filePath) {
   const normalized = normalizeImageDataUrl(dataUrl);
   const match = normalized.match(/^data:image\/[a-zA-Z0-9.+-]+;base64,(.+)$/);
@@ -1205,7 +1482,7 @@ function saveOmniParserDebugOutputs(tag, omniResult, summaryText = '') {
     fs.mkdirSync(debugDir, { recursive: true });
 
     const safeTag = String(tag || 'screen').replace(/[^a-zA-Z0-9_-]+/g, '_');
-    const imagePath = path.join(debugDir, `${safeTag}_omniparser.png`);
+    const imagePath = path.join(debugDir, `${safeTag}_omniparser.jpg`);
     const jsonPath = path.join(debugDir, `${safeTag}_omniparser.json`);
     const textPath = path.join(debugDir, `${safeTag}_omniparser.txt`);
 
@@ -1230,9 +1507,12 @@ function saveOmniParserDebugOutputs(tag, omniResult, summaryText = '') {
   }
 }
 
-function saveToHistory(frames, cleanResponse) {
-  const summary = `[User annotated screen with ${frames.length} screenshots]`;
-  conversationHistory.push({ role: 'user', content: summary });
+function cloneMessageContent(content) {
+  return JSON.parse(JSON.stringify(content));
+}
+
+function saveToHistory(userContent, cleanResponse) {
+  conversationHistory.push({ role: 'user', content: cloneMessageContent(userContent) });
   conversationHistory.push({ role: 'assistant', content: cleanResponse });
   if (conversationHistory.length > MAX_HISTORY * 2) {
     conversationHistory = conversationHistory.slice(-MAX_HISTORY * 2);
@@ -1358,6 +1638,27 @@ async function tavilyWebSearch(rawArgs) {
 
 async function callLLM(messages, hooks = {}) {
   const { onContentChunk, onToolCall } = hooks;
+  const llmCallId = String(++llmCallCounter).padStart(2, '0');
+  const debugPrefix = `llm_call_${llmCallId}`;
+  const requestStartedAt = Date.now();
+  writeLlmDebugJson(`${debugPrefix}_request.json`, {
+    started_at: new Date(requestStartedAt).toISOString(),
+    llm_base: LLM_BASE,
+    model: LLM_MODEL,
+    stream: true,
+    message_count: Array.isArray(messages) ? messages.length : 0,
+    messages: Array.isArray(messages)
+      ? messages.map((message, index) => ({
+          index,
+          role: message?.role || '',
+          content: summarizeMessageContentForDebug(message?.content),
+          tool_call_count: Array.isArray(message?.tool_calls) ? message.tool_calls.length : 0,
+          tool_call_ids: Array.isArray(message?.tool_calls) ? message.tool_calls.map(tc => tc?.id || '') : [],
+          tool_call_names: Array.isArray(message?.tool_calls) ? message.tool_calls.map(tc => tc?.function?.name || '') : []
+        }))
+      : []
+  });
+
   const response = await fetch(`${LLM_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -1374,8 +1675,20 @@ async function callLLM(messages, hooks = {}) {
 
   if (!response.ok) {
     const errText = await response.text();
+    writeLlmDebugJson(`${debugPrefix}_error.json`, {
+      started_at: new Date(requestStartedAt).toISOString(),
+      finished_at: new Date().toISOString(),
+      duration_ms: Date.now() - requestStartedAt,
+      status: response.status,
+      status_text: response.statusText,
+      headers: Object.fromEntries(response.headers.entries()),
+      error_text: trimDebugText(errText, 8000)
+    });
     throw new Error(`HTTP ${response.status}: ${errText.slice(0, 500)}`);
   }
+
+  const responseHeaders = Object.fromEntries(response.headers.entries());
+  const responseContentType = String(response.headers.get('content-type') || '').toLowerCase();
 
   let textContent = '';
   let inThink = false;
@@ -1384,22 +1697,98 @@ async function callLLM(messages, hooks = {}) {
   const reader = response.body;
   let buffer = '';
   const decoder = new TextDecoder();
+  let rawStreamPreview = '';
+  let rawStreamBytes = 0;
+  let sseLineCount = 0;
+  let ignoredLineCount = 0;
+  let jsonParseErrorCount = 0;
+  let contentChunkCount = 0;
+  let toolCallChunkCount = 0;
+  let finishReason = '';
+  let sawDone = false;
+
+  if (!reader) {
+    writeLlmDebugJson(`${debugPrefix}_error.json`, {
+      started_at: new Date(requestStartedAt).toISOString(),
+      finished_at: new Date().toISOString(),
+      duration_ms: Date.now() - requestStartedAt,
+      status: response.status,
+      status_text: response.statusText,
+      headers: Object.fromEntries(response.headers.entries()),
+      error: 'Response body is empty'
+    });
+    throw new Error('LLM response body is empty');
+  }
+
+  if (responseContentType.includes('application/json') && !responseContentType.includes('text/event-stream')) {
+    const payload = await response.json();
+    const message = payload?.choices?.[0]?.message || {};
+    textContent = typeof message?.content === 'string' ? message.content : '';
+    toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+    finishReason = payload?.choices?.[0]?.finish_reason || '';
+
+    writeLlmDebugJson(`${debugPrefix}_response.json`, {
+      started_at: new Date(requestStartedAt).toISOString(),
+      finished_at: new Date().toISOString(),
+      duration_ms: Date.now() - requestStartedAt,
+      status: response.status,
+      status_text: response.statusText,
+      headers: responseHeaders,
+      response_mode: 'json',
+      finish_reason: finishReason || null,
+      text_length: textContent.length,
+      text_preview: trimDebugText(textContent, 2000),
+      tool_call_count: toolCalls.length,
+      tool_calls: toolCalls.map(tc => ({
+        id: tc?.id || '',
+        name: tc?.function?.name || '',
+        arguments_preview: trimDebugText(tc?.function?.arguments || '', 2000)
+      }))
+    });
+    writeLlmDebugArtifact(`${debugPrefix}_stream.txt`, trimDebugText(JSON.stringify(payload, null, 2), 16000));
+
+    if (!textContent.trim() && !toolCalls.length) {
+      console.error(`LLM 返回空 JSON 响应，调试文件: tmp/${path.basename(debugDir || '')}/${debugPrefix}_response.json`);
+      throw new Error(`LLM returned an empty JSON response. Debug saved to tmp/${path.basename(debugDir || '')}/${debugPrefix}_response.json`);
+    }
+
+    return { textContent, toolCalls };
+  }
 
   for await (const chunk of reader) {
-    buffer += decoder.decode(chunk, { stream: true });
-    const lines = buffer.split('\n');
+    const decodedChunk = decoder.decode(chunk, { stream: true });
+    rawStreamBytes += chunk.length || 0;
+    if (rawStreamPreview.length < 16000) {
+      rawStreamPreview += decodedChunk.slice(0, 16000 - rawStreamPreview.length);
+    }
+    buffer += decodedChunk;
+    const lines = buffer.split(/\r?\n/);
     buffer = lines.pop();
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
-      const data = trimmed.slice(6);
-      if (data === '[DONE]') continue;
+      if (!trimmed) continue;
+      if (!trimmed.startsWith('data:')) {
+        ignoredLineCount++;
+        continue;
+      }
+      sseLineCount++;
+      const data = trimmed.slice(5).trimStart();
+      if (data === '[DONE]') {
+        sawDone = true;
+        continue;
+      }
 
       let parsed;
-      try { parsed = JSON.parse(data); } catch { continue; }
+      try { parsed = JSON.parse(data); } catch {
+        jsonParseErrorCount++;
+        continue;
+      }
 
       const delta = parsed.choices?.[0]?.delta;
+      if (parsed.choices?.[0]?.finish_reason) {
+        finishReason = parsed.choices[0].finish_reason;
+      }
       if (!delta) continue;
 
       if (delta.content) {
@@ -1421,9 +1810,11 @@ async function callLLM(messages, hooks = {}) {
             try { onContentChunk(chunk); } catch (error) { console.warn('流式 TTS content hook 失败:', error.message); }
           }
         }
+        contentChunkCount++;
       }
 
       if (delta.tool_calls) {
+        toolCallChunkCount++;
         if (typeof onToolCall === 'function') {
           try { onToolCall(); } catch (error) { console.warn('流式 TTS tool hook 失败:', error.message); }
         }
@@ -1440,6 +1831,44 @@ async function callLLM(messages, hooks = {}) {
         }
       }
     }
+  }
+
+  if (buffer.trim() && rawStreamPreview.length < 16000) {
+    rawStreamPreview += buffer.slice(0, 16000 - rawStreamPreview.length);
+  }
+
+  const debugSummary = {
+    started_at: new Date(requestStartedAt).toISOString(),
+    finished_at: new Date().toISOString(),
+    duration_ms: Date.now() - requestStartedAt,
+    status: response.status,
+    status_text: response.statusText,
+    headers: responseHeaders,
+    response_mode: 'sse',
+    sse_line_count: sseLineCount,
+    ignored_line_count: ignoredLineCount,
+    json_parse_error_count: jsonParseErrorCount,
+    content_chunk_count: contentChunkCount,
+    tool_call_chunk_count: toolCallChunkCount,
+    raw_stream_bytes: rawStreamBytes,
+    saw_done: sawDone,
+    finish_reason: finishReason || null,
+    text_length: textContent.length,
+    text_preview: trimDebugText(textContent, 2000),
+    tool_call_count: toolCalls.length,
+    tool_calls: toolCalls.map(tc => ({
+      id: tc?.id || '',
+      name: tc?.function?.name || '',
+      arguments_preview: trimDebugText(tc?.function?.arguments || '', 2000)
+    }))
+  };
+  const summaryPath = writeLlmDebugJson(`${debugPrefix}_response.json`, debugSummary);
+  writeLlmDebugArtifact(`${debugPrefix}_stream.txt`, rawStreamPreview || '(empty stream)');
+
+  if (!textContent.trim() && !toolCalls.length) {
+    const locationHint = summaryPath ? path.relative(__dirname, summaryPath) : `${debugPrefix}_response.json`;
+    console.error(`LLM 返回空响应，调试文件: ${locationHint}`);
+    throw new Error(`LLM returned an empty response. Debug saved to ${locationHint}`);
   }
 
   return { textContent, toolCalls };
@@ -1573,7 +2002,7 @@ async function runAgentTurn() {
   throw new Error(`Tool loop exceeded ${MAX_TOOL_ROUNDS} rounds`);
 }
 
-async function sendToModel(frames, audioBase64, userText) {
+async function sendToModel(frames, audioBase64, userText, previewOmniContext = null, rawScreenshotDataUrl = '') {
   const systemText = `You are a desktop software assistant that helps users navigate and operate software. The user drew RED marks on their screen to highlight areas of interest.
 
 Screen resolution: ${screenWidth}x${screenHeight} pixels.
@@ -1583,11 +2012,14 @@ Your job:
 2. **Information capture**: If the user highlights text, data, or content, help organize, summarize, or record it. Respond with plain text only (no tools needed).
 3. **Live web lookup**: If the user needs current or external information that is not visible on screen, use tavily_web_search before answering.
 
-When giving step-by-step guidance, call show_tooltip for the current step instruction. show_tooltip should include x and y in absolute screen pixels near the center of the relevant target area. If the OmniParser summary already identifies the target element, also pass element_index with the same summary index so the UI can draw a rectangle around it. If you mention a visible label such as "Model Summary", prefer the exact OmniParser item whose content exactly matches that label. Do not choose nearby paragraphs or longer descriptive text when an exact label match exists. Never use null for x or y. Do NOT list all steps upfront — just describe the current step.
+When giving step-by-step guidance, call show_tooltip for the current step instruction. show_tooltip should include x and y in absolute screen pixels near the center of the relevant target area. If the OmniParser summary already identifies the target element, also pass element_index with the same summary index so the UI can draw a rectangle around it. If you mention a visible label such as "Model Summary", prefer the exact OmniParser item whose content exactly matches that label. Do not choose nearby paragraphs or longer descriptive text when an exact label match exists. Never use null for x or y. Do NOT list all steps upfront — just describe the current step. The tooltip text must sound like a short spoken instruction, not like documentation or written notes.
 Use tavily_web_search sparingly for up-to-date facts, web pages, or recent information. After getting tool results, cite the relevant URLs in your answer when helpful.
 For normal text replies, write like a spoken assistant talking to the user in real time. Prefer short, natural conversational sentences and 1 short paragraph by default.
-Do not use markdown headings, bullet lists, numbered lists, tables, blockquotes, or code fences unless the user explicitly asks for them.
-Avoid document-style wording. Do not structure the reply like an article, report, or notes page.
+Use natural dialogue tone, as if you were speaking aloud to the user beside their screen.
+Do not use markdown syntax or markdown-looking formatting unless the user explicitly asks for it. This includes headings, bullet lists, numbered lists, tables, blockquotes, code fences, inline code, and decorative markers such as #, *, -, 1., >, or backticks.
+Avoid document-style wording. Do not structure the reply like an article, report, checklist, meeting notes, or study notes.
+Do not start with phrases like "下面是", "步骤如下", "总结如下", or similar document-style lead-ins.
+Plain text only. No markdown symbols for structure.
 
 When all steps are complete, respond with a summary in plain text (no tool calls) to signal you are done.
 
@@ -1597,24 +2029,24 @@ Always respond in the same language as the user's note. If no note is provided, 
   stepNumber = 0;
 
   try {
-    const imagesToSend = SEND_ALL_FRAMES ? frames : frames.slice(-1);
-    const content = [{ type: 'text', text: systemText }];
+    const imagesToSend = frames.slice(-1);
+    const content = [];
     const primaryFrame = imagesToSend[imagesToSend.length - 1] ? normalizeImageDataUrl(imagesToSend[imagesToSend.length - 1]) : '';
+    const primaryOmniSourceFrame = rawScreenshotDataUrl
+      ? normalizeImageDataUrl(rawScreenshotDataUrl)
+      : primaryFrame;
     let omniParserSummary = '';
     let omniParserImageDataUrl = '';
 
     if (primaryFrame) {
       try {
-        const omniResult = await preprocessScreenshotWithOmniParser(primaryFrame);
-        latestOmniParserElements = Array.isArray(omniResult.parsedElements) ? omniResult.parsedElements : [];
-        if (omniResult.parsedImageDataUrl) {
-          omniParserImageDataUrl = omniResult.parsedImageDataUrl;
-        }
-        const parsedSummary = summarizeOmniParserElements(omniResult.parsedElements, screenWidth, screenHeight);
-        if (parsedSummary) {
-          omniParserSummary = `OmniParser detected UI elements on the current screen. Use this as extra grounding context, but verify against the screenshot.\n${parsedSummary}`;
-        }
-        saveOmniParserDebugOutputs('initial', omniResult, omniParserSummary);
+        const omniContext = previewOmniContext && previewOmniContext.frameDataUrl === primaryFrame
+          ? previewOmniContext
+          : await buildOmniParserContext(primaryFrame, primaryOmniSourceFrame);
+        latestOmniParserElements = Array.isArray(omniContext.omniResult.parsedElements) ? omniContext.omniResult.parsedElements : [];
+        omniParserImageDataUrl = omniContext.omniParserImageDataUrl;
+        omniParserSummary = omniContext.omniParserSummary;
+        saveOmniParserDebugOutputs('initial', omniContext.omniResult, omniParserSummary);
       } catch (error) {
         latestOmniParserElements = [];
         console.warn('OmniParser 预处理失败，回退到原始截图:', error.message);
@@ -1638,6 +2070,7 @@ Always respond in the same language as the user's note. If no note is provided, 
     }
 
     stepMessages = [
+      { role: 'system', content: systemText },
       ...conversationHistory,
       { role: 'user', content }
     ];
@@ -1645,7 +2078,7 @@ Always respond in the same language as the user's note. If no note is provided, 
     const { textContent, hasTooltip } = await runAgentTurn();
 
     if (!hasTooltip) {
-      saveToHistory(frames, textContent);
+      saveToHistory(content, textContent);
     }
   } catch (error) {
     console.error('API错误:', error.message);
@@ -1657,14 +2090,17 @@ Always respond in the same language as the user's note. If no note is provided, 
   }
 }
 
-async function continueStep(screenshotDataUrl) {
+async function continueStep(screenshotDataUrl, rawScreenshotDataUrl = '') {
   try {
     const url = normalizeImageDataUrl(screenshotDataUrl);
+    const omniSourceUrl = rawScreenshotDataUrl
+      ? normalizeImageDataUrl(rawScreenshotDataUrl)
+      : url;
     let omniParserSummary = '';
     let omniParserImageDataUrl = '';
 
     try {
-      const omniResult = await preprocessScreenshotWithOmniParser(url);
+      const omniResult = await preprocessScreenshotWithOmniParser(omniSourceUrl);
       latestOmniParserElements = Array.isArray(omniResult.parsedElements) ? omniResult.parsedElements : [];
       if (omniResult.parsedImageDataUrl) {
         omniParserImageDataUrl = omniResult.parsedImageDataUrl;
@@ -1680,23 +2116,25 @@ async function continueStep(screenshotDataUrl) {
       console.warn('OmniParser 续步预处理失败，回退到原始截图:', error.message);
     }
 
+    const userContent = [
+      { type: 'text', text: `Here is the current screen after the user clicked "Next". Analyze the screenshot to determine what the user has actually done — do NOT assume the previous step was completed. Based on the current screen state, decide what the user should do next and use show_tooltip. show_tooltip should include x and y in absolute screen pixels near the center of the relevant target area, and x/y must never be null. If the target matches an OmniParser summary item, also include that element_index so the UI can highlight the element with a rectangle. If you refer to a visible label like "Model Summary", prefer the exact OmniParser item whose content exactly matches that label, not a nearby paragraph. The tooltip text must be a short natural spoken sentence, with no markdown syntax or document-style formatting. If all steps are already done, respond with a short plain-text conversational summary and do not use a tool call.` },
+      ...(omniParserSummary ? [{ type: 'text', text: omniParserSummary }] : []),
+      { type: 'image_url', image_url: { url } },
+      ...(omniParserImageDataUrl ? [
+        { type: 'text', text: 'The next image is the same screen preprocessed by OmniParser, with numbered boxes drawn around detected UI elements.' },
+        { type: 'image_url', image_url: { url: omniParserImageDataUrl } }
+      ] : [])
+    ];
+
     stepMessages.push({
       role: 'user',
-      content: [
-        { type: 'text', text: `Here is the current screen after the user clicked "Next". Analyze the screenshot to determine what the user has actually done — do NOT assume the previous step was completed. Based on the current screen state, decide what the user should do next and use show_tooltip. show_tooltip should include x and y in absolute screen pixels near the center of the relevant target area, and x/y must never be null. If the target matches an OmniParser summary item, also include that element_index so the UI can highlight the element with a rectangle. If you refer to a visible label like "Model Summary", prefer the exact OmniParser item whose content exactly matches that label, not a nearby paragraph. If all steps are already done, respond with a summary (no tool call).` },
-        ...(omniParserSummary ? [{ type: 'text', text: omniParserSummary }] : []),
-        { type: 'image_url', image_url: { url } },
-        ...(omniParserImageDataUrl ? [
-          { type: 'text', text: 'The next image is the same screen preprocessed by OmniParser, with numbered boxes drawn around detected UI elements.' },
-          { type: 'image_url', image_url: { url: omniParserImageDataUrl } }
-        ] : [])
-      ]
+      content: userContent
     });
 
     const { textContent, hasTooltip } = await runAgentTurn();
 
     if (!hasTooltip) {
-      saveToHistory([], textContent);
+      saveToHistory(userContent, textContent);
     }
   } catch (error) {
     console.error('下一步API错误:', error.message);

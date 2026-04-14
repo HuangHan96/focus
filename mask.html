@@ -142,6 +142,11 @@
       animation: response-spin 0.8s linear infinite;
       flex-shrink: 0;
     }
+    .response-loading-time {
+      color: rgba(212, 212, 216, 0.72);
+      font-variant-numeric: tabular-nums;
+      margin-left: 2px;
+    }
     @keyframes response-spin {
       to { transform: rotate(360deg); }
     }
@@ -419,6 +424,7 @@
     <div class="response-loading" id="response-loading" aria-hidden="true">
       <span class="response-spinner"></span>
       <span>正在等待回复...</span>
+      <span class="response-loading-time" id="response-loading-time">0.0s</span>
     </div>
     <div id="response-content"></div>
   </div>
@@ -430,6 +436,7 @@
     const responseDiv = document.getElementById('response');
     const responseContent = document.getElementById('response-content');
     const responseLoading = document.getElementById('response-loading');
+    const responseLoadingTime = document.getElementById('response-loading-time');
     const statusDiv = document.getElementById('status');
 
     marked.setOptions({ breaks: true, gfm: true });
@@ -437,10 +444,10 @@
     let isDrawingMode = false;
     let isMouseDown = false;
     let isPreviewShown = false;
+    let currentPreviewId = 0;
     let mediaRecorder = null;
     let audioChunks = [];
     let lastX, lastY;
-    let screenshotTimer = null;
     let pendingAudioBlob = null;
 
     canvas.width = window.innerWidth;
@@ -474,7 +481,6 @@
         statusDiv.className = 'drawing';
         log('进入绘画模式');
         startRecording();
-        startScreenshots();
       } else if (mode === 'idle') {
         isDrawingMode = false;
         isMouseDown = false;
@@ -482,23 +488,6 @@
         statusDiv.className = '';
       }
     });
-
-    // --- Screenshots every 333ms (3 frames per second) ---
-    function startScreenshots() {
-      ipcRenderer.send('capture-screenshot');
-      screenshotTimer = setInterval(() => {
-        if (isDrawingMode) {
-          ipcRenderer.send('capture-screenshot');
-        }
-      }, 333);
-    }
-
-    function stopScreenshots() {
-      if (screenshotTimer) {
-        clearInterval(screenshotTimer);
-        screenshotTimer = null;
-      }
-    }
 
     // --- Detect Alt release to exit drawing mode ---
     document.addEventListener('keyup', async (e) => {
@@ -508,18 +497,11 @@
         canvas.classList.remove('drawing');
         statusDiv.className = '';
 
-        stopScreenshots();
         pendingAudioBlob = await stopRecording();
 
         // Wait 333ms then capture one final full-screen screenshot
         await new Promise(resolve => setTimeout(resolve, 333));
         ipcRenderer.send('capture-final-screenshot');
-
-        // Small delay to let the screenshot IPC complete
-        await new Promise(resolve => setTimeout(resolve, 100));
-
-        // Request preview from main (don't send drawing-done yet - keep window interactive)
-        ipcRenderer.send('request-preview');
       }
     });
 
@@ -531,20 +513,32 @@
     const previewSend = document.getElementById('preview-send');
     const previewCancel = document.getElementById('preview-cancel');
 
-    ipcRenderer.on('show-preview', (event, frames) => {
-      isPreviewShown = true;
-
-      // Populate frame thumbnails
+    function renderPreviewFrames(frames, omniParserImageDataUrl = '') {
       previewFrames.innerHTML = '';
-      frames.forEach((dataUrl, i) => {
+      frames.forEach((dataUrl) => {
         const img = document.createElement('img');
         img.src = dataUrl;
-        if (i === frames.length - 1) img.className = 'last-frame';
-        img.title = i === frames.length - 1 ? `#${i + 1} (全屏)` : `#${i + 1}`;
+        img.className = 'last-frame';
+        img.title = '全屏截图';
         previewFrames.appendChild(img);
       });
-      // Scroll to end
-      previewFrames.scrollLeft = previewFrames.scrollWidth;
+      if (omniParserImageDataUrl) {
+        const omniImg = document.createElement('img');
+        omniImg.src = omniParserImageDataUrl;
+        omniImg.className = 'last-frame';
+        omniImg.title = 'OmniParser 标注图';
+        previewFrames.appendChild(omniImg);
+      }
+      previewFrames.scrollLeft = 0;
+    }
+
+    ipcRenderer.on('show-preview', (event, payload) => {
+      isPreviewShown = true;
+      currentPreviewId = Number.isFinite(payload?.previewId) ? payload.previewId : 0;
+      const frames = Array.isArray(payload?.frames) ? payload.frames : [];
+      const omniParserImageDataUrl = typeof payload?.omniParserImageDataUrl === 'string' ? payload.omniParserImageDataUrl : '';
+
+      renderPreviewFrames(frames, omniParserImageDataUrl);
 
       // Audio preview
       previewAudioWrap.innerHTML = '';
@@ -566,10 +560,19 @@
       previewInput.focus();
     });
 
+    ipcRenderer.on('preview-omniparser', (event, payload) => {
+      if (!isPreviewShown) return;
+      if ((Number.isFinite(payload?.previewId) ? payload.previewId : 0) !== currentPreviewId) return;
+      const frames = Array.isArray(payload?.frames) ? payload.frames : [];
+      const omniParserImageDataUrl = typeof payload?.omniParserImageDataUrl === 'string' ? payload.omniParserImageDataUrl : '';
+      renderPreviewFrames(frames, omniParserImageDataUrl);
+    });
+
     async function doPreviewSend() {
       const userText = previewInput.value.trim();
       previewDialog.classList.remove('visible');
       isPreviewShown = false;
+      currentPreviewId = 0;
 
       log('发送中...');
       const audioBase64 = await blobToBase64(pendingAudioBlob);
@@ -585,6 +588,7 @@
     function doPreviewCancel() {
       previewDialog.classList.remove('visible');
       isPreviewShown = false;
+      currentPreviewId = 0;
       pendingAudioBlob = null;
 
       ipcRenderer.send('cancel-send');
@@ -684,6 +688,8 @@
     let fadeTimer = null;
     let responseRenderTimer = null;
     let lastResponseRenderAt = 0;
+    let loadingStartedAt = 0;
+    let loadingElapsedTimer = null;
     let streamBuffer = '';
     let ttsAudioContext = null;
     let ttsPlaybackId = 0;
@@ -691,9 +697,9 @@
     let ttsChannels = 2;
     let ttsSampleRate = 48000;
     const activeTtsSources = new Set();
-    const RESPONSE_RENDER_THROTTLE_MS = 80;
-    const TTS_SCHEDULE_AHEAD_SECONDS = 0.08;
-    const TTS_INITIAL_AHEAD_SECONDS = 0.12;
+    const RESPONSE_RENDER_THROTTLE_MS = 160;
+    const TTS_SCHEDULE_AHEAD_SECONDS = 0.2;
+    const TTS_INITIAL_AHEAD_SECONDS = 0.45;
 
     function ensureTtsAudioContext() {
       if (!ttsAudioContext || ttsAudioContext.state === 'closed') {
@@ -800,6 +806,36 @@
       responseDiv.classList.add('visible');
     }
 
+    function formatLoadingElapsed(ms) {
+      return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+    }
+
+    function updateLoadingElapsed() {
+      if (!loadingStartedAt) {
+        responseLoadingTime.textContent = '0.0s';
+        return;
+      }
+      responseLoadingTime.textContent = formatLoadingElapsed(performance.now() - loadingStartedAt);
+    }
+
+    function startLoadingElapsed() {
+      loadingStartedAt = performance.now();
+      updateLoadingElapsed();
+      if (loadingElapsedTimer) clearInterval(loadingElapsedTimer);
+      loadingElapsedTimer = setInterval(updateLoadingElapsed, 100);
+    }
+
+    function stopLoadingElapsed() {
+      if (loadingElapsedTimer) {
+        clearInterval(loadingElapsedTimer);
+        loadingElapsedTimer = null;
+      }
+      if (loadingStartedAt) {
+        updateLoadingElapsed();
+      }
+      loadingStartedAt = 0;
+    }
+
     function hasResponseContent() {
       return Boolean(responseContent.textContent.trim());
     }
@@ -810,6 +846,7 @@
       responseLoading.setAttribute('aria-hidden', String(!isLoading));
 
       if (isLoading) {
+        if (!loadingStartedAt) startLoadingElapsed();
         showResponse();
       } else if (!hasResponseContent()) {
         responseDiv.classList.remove('visible', 'fade-out');
@@ -834,6 +871,8 @@
         streamBuffer = '';
         responseContent.textContent = '';
         stopTtsPlayback();
+      } else {
+        stopLoadingElapsed();
       }
 
       setResponseLoading(isLoading);

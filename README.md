@@ -6,7 +6,7 @@ A desktop screen annotation assistant. Draw on your screen and talk to an AI abo
 
 1. Press **Alt+D** to enter drawing mode
 2. **Draw** on screen with your mouse (red ink) and **speak** to describe your question
-3. **Release Alt** to send — the app captures a screenshot sequence (every 0.5s) of your drawing process along with your voice, and sends everything to the AI model
+3. **Release Alt** to send — the app captures the final full-screen screenshot along with your voice, and sends it to the AI model
 4. The model's response appears in the bottom-right corner of your screen and is spoken aloud through MOSS-TTS-Nano
 
 The spoken response uses sentence-level streaming: as soon as the LLM emits a stable sentence fragment, the app starts a MOSS-TTS streaming request instead of waiting for the full answer to finish.
@@ -43,7 +43,8 @@ OMNIPARSER_PORT=18084
 `MOSS_TTS_AUDIO_TOKENIZER_PATH` is optional; if unset, the app will first try the local Hugging Face cache snapshot and then fall back to the remote repo id.
 `MOSS_TTS_CHECKPOINT_PATH` is also optional, but a local checkpoint path only works if that directory already contains the TTS text tokenizer files. Otherwise the app falls back to the upstream repo id so MOSS can resolve the tokenizer itself.
 The Electron app will auto-start the FastAPI TTS server and use its streaming endpoint for low-latency playback.
-If `OMNIPARSER_REPO_PATH` points to a valid OmniParser checkout with weights, the app will auto-start OmniParser and preprocess the latest full-screen screenshot before sending it to the LLM. The LLM then receives the original screenshot, the OmniParser labeled screenshot, and a compact UI element summary.
+If `OMNIPARSER_REPO_PATH` points to a valid OmniParser checkout with weights, the app will auto-start OmniParser and preprocess the latest full-screen screenshot before sending it to the LLM. The LLM then receives the original screenshot, the OmniParser labeled screenshot, and the full text UI element list.
+By default, Focus now starts OmniParser with `easyocr` and `ch_sim,en`, so Chinese and English text can both be recognized if the local EasyOCR model files are present.
 
 ## Usage
 
@@ -54,7 +55,7 @@ npm start
 ## Debug
 
 Each annotation session is saved to `tmp/{task_id}/` containing:
-- `frame_000.webp`, `frame_001.webp`, ... — screenshot sequence
+- `frame_000.jpg` — final full-screen screenshot
 - `audio.webm` — voice recording
 
 ## Tech stack
