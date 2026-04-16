@@ -351,6 +351,9 @@
     .preview-frames img.last-frame {
       border-color: rgba(59, 130, 246, 0.6);
     }
+    .preview-frames img:active {
+      transform: scale(0.985);
+    }
     .preview-audio {
       margin-bottom: 14px;
     }
@@ -365,6 +368,47 @@
       font-family: -apple-system, sans-serif;
       font-style: italic;
       margin-bottom: 14px;
+    }
+    .preview-mode {
+      margin-bottom: 14px;
+    }
+    .preview-mode-switch {
+      display: flex;
+      gap: 8px;
+    }
+    .preview-mode-btn {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 3px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      padding: 10px 12px;
+      color: #a1a1aa;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+    }
+    .preview-mode-btn:hover {
+      border-color: rgba(255, 255, 255, 0.18);
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .preview-mode-btn.active {
+      border-color: rgba(59, 130, 246, 0.6);
+      background: rgba(59, 130, 246, 0.12);
+      color: #e4e4e7;
+    }
+    .preview-mode-title {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .preview-mode-desc {
+      font-size: 11px;
+      line-height: 1.45;
+      color: inherit;
+      opacity: 0.82;
+      text-align: left;
     }
     #preview-input {
       width: 100%;
@@ -402,6 +446,58 @@
     .preview-btn-cancel:hover { background: rgba(255,255,255,0.12); }
     .preview-btn-send { background: rgba(59,130,246,0.85); color: #fff; }
     .preview-btn-send:hover { background: rgba(59,130,246,1); }
+    #image-lightbox {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(9, 9, 11, 0.82);
+      z-index: 10020;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      padding: 28px;
+      box-sizing: border-box;
+    }
+    #image-lightbox.visible {
+      display: flex;
+    }
+    .image-lightbox-panel {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: min(94vw, 1800px);
+      max-height: 92vh;
+    }
+    .image-lightbox-close {
+      align-self: flex-end;
+      background: rgba(255, 255, 255, 0.08);
+      color: #e4e4e7;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .image-lightbox-close:hover {
+      background: rgba(255, 255, 255, 0.12);
+    }
+    #image-lightbox-img {
+      display: block;
+      max-width: min(94vw, 1800px);
+      max-height: calc(92vh - 44px);
+      width: auto;
+      height: auto;
+      border-radius: 12px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+      background: rgba(255, 255, 255, 0.02);
+    }
+    #image-lightbox-caption {
+      color: #d4d4d8;
+      font-size: 12px;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -412,6 +508,19 @@
     <div class="preview-frames" id="preview-frames"></div>
     <div class="preview-label">录音</div>
     <div class="preview-audio" id="preview-audio-wrap"></div>
+    <div class="preview-mode">
+      <div class="preview-label">交互模式</div>
+      <div class="preview-mode-switch">
+        <button class="preview-mode-btn" id="preview-mode-tooltip" type="button">
+          <span class="preview-mode-title">提示指导</span>
+          <span class="preview-mode-desc">模型用 tooltip 引导你自己操作</span>
+        </button>
+        <button class="preview-mode-btn" id="preview-mode-computer" type="button">
+          <span class="preview-mode-title">直接控制</span>
+          <span class="preview-mode-desc">模型调用工具直接操作电脑</span>
+        </button>
+      </div>
+    </div>
     <div class="preview-label">补充说明（可选）</div>
     <textarea id="preview-input" rows="2" placeholder="描述你想问的问题..."></textarea>
     <div class="preview-buttons">
@@ -427,6 +536,13 @@
       <span class="response-loading-time" id="response-loading-time">0.0s</span>
     </div>
     <div id="response-content"></div>
+  </div>
+  <div id="image-lightbox">
+    <div class="image-lightbox-panel">
+      <button class="image-lightbox-close" id="image-lightbox-close" type="button">关闭</button>
+      <img id="image-lightbox-img" alt="preview enlarged">
+      <div id="image-lightbox-caption"></div>
+    </div>
   </div>
   <script>
     const { ipcRenderer } = require('electron');
@@ -510,24 +626,52 @@
     const previewFrames = document.getElementById('preview-frames');
     const previewAudioWrap = document.getElementById('preview-audio-wrap');
     const previewInput = document.getElementById('preview-input');
+    const previewModeTooltip = document.getElementById('preview-mode-tooltip');
+    const previewModeComputer = document.getElementById('preview-mode-computer');
     const previewSend = document.getElementById('preview-send');
     const previewCancel = document.getElementById('preview-cancel');
+    const imageLightbox = document.getElementById('image-lightbox');
+    const imageLightboxImg = document.getElementById('image-lightbox-img');
+    const imageLightboxCaption = document.getElementById('image-lightbox-caption');
+    const imageLightboxClose = document.getElementById('image-lightbox-close');
+    let previewInteractionMode = 'tooltip';
+
+    function setPreviewInteractionMode(mode) {
+      previewInteractionMode = mode === 'computer' ? 'computer' : 'tooltip';
+      previewModeTooltip.classList.toggle('active', previewInteractionMode === 'tooltip');
+      previewModeComputer.classList.toggle('active', previewInteractionMode === 'computer');
+    }
+    setPreviewInteractionMode('tooltip');
+
+    function openImageLightbox(src, title = '') {
+      if (!src) return;
+      imageLightboxImg.src = src;
+      imageLightboxCaption.textContent = title || '';
+      imageLightbox.classList.add('visible');
+    }
+
+    function closeImageLightbox() {
+      imageLightbox.classList.remove('visible');
+      imageLightboxImg.removeAttribute('src');
+      imageLightboxCaption.textContent = '';
+    }
+
+    function makePreviewImage(dataUrl, title) {
+      const img = document.createElement('img');
+      img.src = dataUrl;
+      img.className = 'last-frame';
+      img.title = `${title}，点击放大`;
+      img.addEventListener('click', () => openImageLightbox(dataUrl, title));
+      return img;
+    }
 
     function renderPreviewFrames(frames, omniParserImageDataUrl = '') {
       previewFrames.innerHTML = '';
       frames.forEach((dataUrl) => {
-        const img = document.createElement('img');
-        img.src = dataUrl;
-        img.className = 'last-frame';
-        img.title = '全屏截图';
-        previewFrames.appendChild(img);
+        previewFrames.appendChild(makePreviewImage(dataUrl, '全屏截图'));
       });
       if (omniParserImageDataUrl) {
-        const omniImg = document.createElement('img');
-        omniImg.src = omniParserImageDataUrl;
-        omniImg.className = 'last-frame';
-        omniImg.title = 'OmniParser 标注图';
-        previewFrames.appendChild(omniImg);
+        previewFrames.appendChild(makePreviewImage(omniParserImageDataUrl, 'OmniParser 标注图'));
       }
       previewFrames.scrollLeft = 0;
     }
@@ -537,6 +681,7 @@
       currentPreviewId = Number.isFinite(payload?.previewId) ? payload.previewId : 0;
       const frames = Array.isArray(payload?.frames) ? payload.frames : [];
       const omniParserImageDataUrl = typeof payload?.omniParserImageDataUrl === 'string' ? payload.omniParserImageDataUrl : '';
+      setPreviewInteractionMode(payload?.interactionMode);
 
       renderPreviewFrames(frames, omniParserImageDataUrl);
 
@@ -570,13 +715,14 @@
 
     async function doPreviewSend() {
       const userText = previewInput.value.trim();
+      closeImageLightbox();
       previewDialog.classList.remove('visible');
       isPreviewShown = false;
       currentPreviewId = 0;
 
       log('发送中...');
       const audioBase64 = await blobToBase64(pendingAudioBlob);
-      ipcRenderer.send('confirm-send', audioBase64, userText);
+      ipcRenderer.send('confirm-send', audioBase64, userText, previewInteractionMode);
       ipcRenderer.send('drawing-done');
       pendingAudioBlob = null;
 
@@ -586,6 +732,7 @@
     }
 
     function doPreviewCancel() {
+      closeImageLightbox();
       previewDialog.classList.remove('visible');
       isPreviewShown = false;
       currentPreviewId = 0;
@@ -599,8 +746,27 @@
 
     previewSend.addEventListener('click', doPreviewSend);
     previewCancel.addEventListener('click', doPreviewCancel);
+    previewModeTooltip.addEventListener('click', () => setPreviewInteractionMode('tooltip'));
+    previewModeComputer.addEventListener('click', () => setPreviewInteractionMode('computer'));
+    imageLightboxClose.addEventListener('click', closeImageLightbox);
+    imageLightbox.addEventListener('click', (e) => {
+      if (e.target === imageLightbox) {
+        closeImageLightbox();
+      }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && imageLightbox.classList.contains('visible')) {
+        e.preventDefault();
+        closeImageLightbox();
+      }
+    });
 
     previewInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && imageLightbox.classList.contains('visible')) {
+        e.preventDefault();
+        closeImageLightbox();
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         doPreviewSend();

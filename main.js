@@ -1,13 +1,32 @@
-const { app, BrowserWindow, screen, desktopCapturer, ipcMain, globalShortcut, nativeImage } = require('electron');
+const { app, BrowserWindow, screen, desktopCapturer, ipcMain, globalShortcut, nativeImage, session } = require('electron');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 require('dotenv').config();
+
+function parseEnvBool(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+function firstNonEmptyEnvValue(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    const normalized = String(value).trim();
+    if (normalized) return normalized;
+  }
+  return '';
+}
 
 const LLM_BASE = process.env.LLM_BASE || 'http://54.219.66.60:3000/v1';
 const LLM_MODEL = process.env.LLM_MODEL || 'gpt-5.4';
 const LLM_API_KEY = process.env.LLM_API_KEY || 'sk-Q8fv7Pdn1xGMCRsBawXvUlU4jY3sHSetRkAUP6MeI8L0iiqn';
+const LOCAL_LLM_COMPACT_MODE = /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(LLM_BASE);
+const VISION_ENABLE = parseEnvBool(process.env.VISION_ENABLE, true);
 const TAVILY_BASE = process.env.TAVILY_BASE || 'https://api.tavily.com/search';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 const MAX_TOOL_ROUNDS = 4;
@@ -23,6 +42,7 @@ const TTS_STREAM_MAX_CHARS = 180;
 const TTS_STREAM_HARD_MAX_CHARS = 320;
 const TTS_IPC_CHUNK_FLUSH_BYTES = 24 * 1024;
 const TTS_IPC_CHUNK_FLUSH_MS = 90;
+const MAX_COMPUTER_TOOL_ROUNDS = clampEnvInt(process.env.MAX_COMPUTER_TOOL_ROUNDS, 10);
 const TTS_PYTHON = process.env.MOSS_TTS_PYTHON || path.join(TTS_REPO_PATH, '.venv', 'bin', 'python');
 const TTS_DEMO_METADATA_PATH = path.join(TTS_REPO_PATH, 'assets', 'demo.jsonl');
 const TTS_HF_HOME = process.env.MOSS_TTS_HF_HOME || path.join(__dirname, '.cache', 'moss-huggingface');
@@ -52,69 +72,183 @@ const OMNIPARSER_INPUT_MAX_WIDTH = clampEnvInt(process.env.OMNIPARSER_INPUT_MAX_
 const OMNIPARSER_INPUT_MAX_HEIGHT = clampEnvInt(process.env.OMNIPARSER_INPUT_MAX_HEIGHT, 1080);
 const OMNIPARSER_INPUT_JPEG_QUALITY = clampEnvInt(process.env.OMNIPARSER_INPUT_JPEG_QUALITY, 68);
 const OMNIPARSER_IMAGE_JPEG_QUALITY = clampEnvInt(process.env.OMNIPARSER_IMAGE_JPEG_QUALITY, 72);
+const LLM_OMNIPARSER_SUMMARY_LIMIT = clampEnvInt(process.env.LLM_OMNIPARSER_SUMMARY_LIMIT, LOCAL_LLM_COMPACT_MODE ? 36 : OMNIPARSER_MAX_ELEMENTS);
+const LLM_OMNIPARSER_CONTENT_TRUNCATE = clampEnvInt(process.env.LLM_OMNIPARSER_CONTENT_TRUNCATE, LOCAL_LLM_COMPACT_MODE ? 64 : 160);
+const LLM_INCLUDE_OMNIPARSER_IMAGE = parseEnvBool(process.env.LLM_INCLUDE_OMNIPARSER_IMAGE, !LOCAL_LLM_COMPACT_MODE);
 const HF_CACHE_DIR = path.join(os.homedir(), '.cache', 'huggingface', 'hub');
+const COMPUTER_CONTROL_SCRIPT_PATH = path.join(__dirname, 'computer_control.py');
+const INTERACTION_MODE_TOOLTIP = 'tooltip';
+const INTERACTION_MODE_COMPUTER = 'computer';
 
 // 是否发送绘画过程中的截图序列，关闭后只发送最后一张完整截图
 const SEND_ALL_FRAMES = false;
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
-const TOOLS = [
+const TAVILY_TOOL = {
+  type: 'function',
+  function: {
+    name: 'tavily_web_search',
+    description: 'Search the live web with Tavily when the answer requires up-to-date or external information not visible in the screenshot.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'The web search query.' },
+        topic: {
+          type: 'string',
+          enum: ['general', 'news', 'finance'],
+          description: 'Search topic. Use news for recent events and finance for market data.'
+        },
+        search_depth: {
+          type: 'string',
+          enum: ['basic', 'advanced', 'fast', 'ultra-fast'],
+          description: 'Latency vs. relevance tradeoff.'
+        },
+        max_results: {
+          type: 'integer',
+          description: 'Maximum number of search results to return, from 1 to 10.'
+        },
+        time_range: {
+          type: 'string',
+          enum: ['day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'],
+          description: 'Optional recency filter.'
+        },
+        days: {
+          type: 'integer',
+          description: 'Optional number of days back for news searches.'
+        }
+      },
+      required: ['query']
+    }
+  }
+};
+
+const TOOLTIP_GUIDANCE_TOOL = {
+  type: 'function',
+  function: {
+    name: 'show_tooltip',
+    description: 'Display the current step instruction on screen. Only call this once per step. The user will press "Next" to proceed. When all steps are complete, do NOT call this tool — just reply with text.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Brief instruction for this step in the user\'s language.' },
+        x: { type: 'number', description: 'Required X coordinate in absolute screen pixels for the relevant target area.' },
+        y: { type: 'number', description: 'Required Y coordinate in absolute screen pixels for the relevant target area.' },
+        element_index: { type: 'integer', description: 'Optional OmniParser element index to highlight with a rectangle. Use the same index shown in the OmniParser summary when it matches the target UI element.' }
+      },
+      required: ['text', 'x', 'y']
+    }
+  }
+};
+
+const TOOLTIP_TOOLS = [TOOLTIP_GUIDANCE_TOOL, TAVILY_TOOL];
+
+const COMPUTER_CONTROL_TOOLS = [
   {
     type: 'function',
     function: {
-      name: 'show_tooltip',
-      description: 'Display the current step instruction on screen. Only call this once per step. The user will press "Next" to proceed. When all steps are complete, do NOT call this tool — just reply with text.',
+      name: 'computer_click',
+      description: 'Click on the screen at absolute screen coordinates. Prefer a single click unless the UI clearly requires a double click.',
       parameters: {
         type: 'object',
         properties: {
-          text: { type: 'string', description: 'Brief instruction for this step in the user\'s language.' },
-          x: { type: 'number', description: 'Required X coordinate in absolute screen pixels for the relevant target area.' },
-          y: { type: 'number', description: 'Required Y coordinate in absolute screen pixels for the relevant target area.' },
-          element_index: { type: 'integer', description: 'Optional OmniParser element index to highlight with a rectangle. Use the same index shown in the OmniParser summary when it matches the target UI element.' }
+          x: { type: 'number', description: 'Absolute X coordinate in screen pixels.' },
+          y: { type: 'number', description: 'Absolute Y coordinate in screen pixels.' },
+          button: {
+            type: 'string',
+            enum: ['left', 'right', 'middle'],
+            description: 'Mouse button to click.'
+          },
+          clicks: {
+            type: 'integer',
+            description: 'Number of clicks. Use 2 only when double click is clearly required.'
+          }
         },
-        required: ['text', 'x', 'y']
+        required: ['x', 'y']
       }
     }
   },
   {
     type: 'function',
     function: {
-      name: 'tavily_web_search',
-      description: 'Search the live web with Tavily when the answer requires up-to-date or external information not visible in the screenshot.',
+      name: 'computer_move_cursor',
+      description: 'Move the cursor to absolute screen coordinates without clicking. Use this only when hover behavior matters.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'The web search query.' },
-          topic: {
-            type: 'string',
-            enum: ['general', 'news', 'finance'],
-            description: 'Search topic. Use news for recent events and finance for market data.'
-          },
-          search_depth: {
-            type: 'string',
-            enum: ['basic', 'advanced', 'fast', 'ultra-fast'],
-            description: 'Latency vs. relevance tradeoff.'
-          },
-          max_results: {
-            type: 'integer',
-            description: 'Maximum number of search results to return, from 1 to 10.'
-          },
-          time_range: {
-            type: 'string',
-            enum: ['day', 'week', 'month', 'year', 'd', 'w', 'm', 'y'],
-            description: 'Optional recency filter.'
-          },
-          days: {
-            type: 'integer',
-            description: 'Optional number of days back for news searches.'
+          x: { type: 'number', description: 'Absolute X coordinate in screen pixels.' },
+          y: { type: 'number', description: 'Absolute Y coordinate in screen pixels.' }
+        },
+        required: ['x', 'y']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'computer_type_text',
+      description: 'Type or paste text into the current focused field. Use this after the target input is already focused.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Text to input.' },
+          submit: { type: 'boolean', description: 'Press Enter after typing when true.' }
+        },
+        required: ['text']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'computer_press_keys',
+      description: 'Press one or more keys together, for example command+l or enter.',
+      parameters: {
+        type: 'object',
+        properties: {
+          keys: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'List of key names to press together.'
           }
         },
-        required: ['query']
+        required: ['keys']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'computer_scroll',
+      description: 'Scroll the current view. Negative delta_y scrolls down, positive delta_y scrolls up.',
+      parameters: {
+        type: 'object',
+        properties: {
+          delta_y: { type: 'integer', description: 'Scroll amount. Negative for down, positive for up.' },
+          x: { type: 'number', description: 'Optional X coordinate to move to before scrolling.' },
+          y: { type: 'number', description: 'Optional Y coordinate to move to before scrolling.' }
+        },
+        required: ['delta_y']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'computer_wait',
+      description: 'Wait briefly for the UI to update after an action such as navigation or loading.',
+      parameters: {
+        type: 'object',
+        properties: {
+          duration_ms: { type: 'integer', description: 'Wait duration in milliseconds.' }
+        },
+        required: ['duration_ms']
       }
     }
   }
 ];
+
+const COMPUTER_TOOLS = [...COMPUTER_CONTROL_TOOLS, TAVILY_TOOL];
 
 let maskWindow;
 let screenWidth, screenHeight;
@@ -139,6 +273,7 @@ let previewSequence = 0;
 let llmCallCounter = 0;
 let activeTtsSession = null;
 let ttsPlaybackRunId = 0;
+let activeInteractionMode = INTERACTION_MODE_TOOLTIP;
 const resolvedLocalTtsCheckpointPath = resolveCachedSnapshotPath('OpenMOSS-Team/MOSS-TTS-Nano');
 const TTS_CHECKPOINT_PATH = process.env.MOSS_TTS_CHECKPOINT_PATH || (hasUsableLocalTtsTokenizer(resolvedLocalTtsCheckpointPath) ? resolvedLocalTtsCheckpointPath : 'OpenMOSS-Team/MOSS-TTS-Nano');
 const TTS_AUDIO_TOKENIZER_PATH = process.env.MOSS_TTS_AUDIO_TOKENIZER_PATH || resolveCachedSnapshotPath('OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano') || 'OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano';
@@ -147,6 +282,70 @@ const ttsDemoEntries = loadTtsDemoEntries();
 function clampEnvInt(value, fallback) {
   const num = Number.parseInt(String(value || ''), 10);
   return Number.isFinite(num) && num > 0 ? num : fallback;
+}
+
+function buildProxyConfigFromEnv() {
+  const httpProxy = firstNonEmptyEnvValue(process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy);
+  const httpsProxy = firstNonEmptyEnvValue(process.env.HTTPS_PROXY, process.env.https_proxy, process.env.ALL_PROXY, process.env.all_proxy);
+  const noProxy = firstNonEmptyEnvValue(process.env.NO_PROXY, process.env.no_proxy);
+  const proxyRules = [];
+
+  if (httpProxy) proxyRules.push(`http=${httpProxy}`);
+  if (httpsProxy) proxyRules.push(`https=${httpsProxy}`);
+  if (!proxyRules.length) return null;
+
+  const bypassRules = [noProxy, '<local>'].filter(Boolean).join(',');
+  return {
+    mode: 'fixed_servers',
+    proxyRules: proxyRules.join(';'),
+    proxyBypassRules: bypassRules
+  };
+}
+
+async function configureProxyFromEnv() {
+  const proxyConfig = buildProxyConfigFromEnv();
+  if (!proxyConfig) {
+    console.log('未配置外部代理，使用默认网络设置');
+    return;
+  }
+
+  await session.defaultSession.setProxy(proxyConfig);
+  await session.defaultSession.closeAllConnections();
+  console.log(`已启用代理: ${proxyConfig.proxyRules}${proxyConfig.proxyBypassRules ? ` | bypass=${proxyConfig.proxyBypassRules}` : ''}`);
+}
+
+async function appFetch(url, options = {}) {
+  if (app.isReady() && session?.defaultSession?.fetch) {
+    return session.defaultSession.fetch(url, options);
+  }
+  return fetch(url, options);
+}
+
+async function *iterateResponseBodyChunks(body) {
+  if (!body) return;
+
+  if (typeof body[Symbol.asyncIterator] === 'function') {
+    for await (const chunk of body) {
+      yield chunk;
+    }
+    return;
+  }
+
+  if (typeof body.getReader === 'function') {
+    const reader = body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) yield value;
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    return;
+  }
+
+  throw new Error('Unsupported response body stream');
 }
 
 function resolveCachedSnapshotPath(modelId) {
@@ -291,7 +490,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = TTS_REQUEST_TIMEO
   }
 
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await appFetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timer);
     if (cleanupAbortListener) cleanupAbortListener();
@@ -490,6 +689,14 @@ function summarizeOmniParserElements(elements, imageWidth, imageHeight, options 
   return lines.join('\n');
 }
 
+function extractProviderErrorMessage(payload) {
+  if (!payload) return '';
+  if (typeof payload?.error === 'string') return payload.error;
+  if (typeof payload?.error?.message === 'string') return payload.error.message;
+  if (typeof payload?.message === 'string') return payload.message;
+  return '';
+}
+
 function normalizeOmniParserElementIndex(value) {
   const index = Number.parseInt(String(value), 10);
   return Number.isFinite(index) && index >= 0 ? index : null;
@@ -640,7 +847,10 @@ async function buildOmniParserContext(frameDataUrl, omniSourceFrameDataUrl = '')
     ? normalizeImageDataUrl(omniSourceFrameDataUrl)
     : normalizedFrame;
   const omniResult = await preprocessScreenshotWithOmniParser(normalizedOmniSourceFrame);
-  const parsedSummary = summarizeOmniParserElements(omniResult.parsedElements, screenWidth, screenHeight);
+  const parsedSummary = summarizeOmniParserElements(omniResult.parsedElements, screenWidth, screenHeight, {
+    limit: LLM_OMNIPARSER_SUMMARY_LIMIT,
+    truncateContent: LLM_OMNIPARSER_CONTENT_TRUNCATE
+  });
   const omniParserSummary = parsedSummary
     ? `OmniParser detected UI elements on the current screen. Use this as extra grounding context, but verify against the screenshot.\n${parsedSummary}`
     : '';
@@ -686,6 +896,7 @@ function pushPreviewWindow(frames, previewId, omniSourceFrameDataUrl = '') {
   maskWindow.webContents.send('show-preview', {
     frames,
     previewId,
+    interactionMode: activeInteractionMode,
     omniParserImageDataUrl: pendingPreviewOmniContext?.frameDataUrl === primaryFrame
       ? pendingPreviewOmniContext.omniParserImageDataUrl
       : ''
@@ -1288,10 +1499,11 @@ async function createMaskWindow() {
     pushPreviewWindow(frames, previewId, currentRawScreenshotDataUrl);
   });
 
-  ipcMain.on('confirm-send', async (event, audioBase64, userText) => {
+  ipcMain.on('confirm-send', async (event, audioBase64, userText, interactionMode) => {
     try {
       const frames = [...screenshots];
       const rawScreenshotDataUrl = currentRawScreenshotDataUrl;
+      activeInteractionMode = normalizeInteractionMode(interactionMode);
       screenshots = [];
       previewSequence += 1;
       const previewOmniContext = pendingPreviewOmniContextPromise && pendingPreviewOmniFrameDataUrl === (frames[0] ? normalizeImageDataUrl(frames[0]) : '')
@@ -1303,7 +1515,7 @@ async function createMaskWindow() {
       stopTtsPlayback();
       setModelLoading(true);
       saveDebugData(frames, audioBase64);
-      await sendToModel(frames, audioBase64, userText, previewOmniContext, rawScreenshotDataUrl);
+      await sendToModel(frames, audioBase64, userText, previewOmniContext, rawScreenshotDataUrl, activeInteractionMode);
     } catch (error) {
       console.error('错误:', error.message);
       sendModelError(`请求失败，请重试。\n\n\`${error.message}\``);
@@ -1519,6 +1731,22 @@ function saveToHistory(userContent, cleanResponse) {
   }
 }
 
+function normalizeInteractionMode(mode) {
+  return mode === INTERACTION_MODE_COMPUTER ? INTERACTION_MODE_COMPUTER : INTERACTION_MODE_TOOLTIP;
+}
+
+function getToolsForInteractionMode(mode) {
+  return normalizeInteractionMode(mode) === INTERACTION_MODE_COMPUTER ? COMPUTER_TOOLS : TOOLTIP_TOOLS;
+}
+
+function getMaxToolRoundsForInteractionMode(mode) {
+  return normalizeInteractionMode(mode) === INTERACTION_MODE_COMPUTER ? MAX_COMPUTER_TOOL_ROUNDS : MAX_TOOL_ROUNDS;
+}
+
+function isComputerControlToolName(toolName) {
+  return COMPUTER_CONTROL_TOOLS.some(tool => tool?.function?.name === toolName);
+}
+
 function setModelLoading(isLoading) {
   if (maskWindow && !maskWindow.isDestroyed()) {
     maskWindow.webContents.send('model-loading', isLoading);
@@ -1606,7 +1834,7 @@ async function tavilyWebSearch(rawArgs) {
     payload.days = clampInt(rawArgs.days, 7, 1, 365);
   }
 
-  const response = await fetch(TAVILY_BASE, {
+  const response = await appFetch(TAVILY_BASE, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1636,7 +1864,154 @@ async function tavilyWebSearch(rawArgs) {
   };
 }
 
-async function callLLM(messages, hooks = {}) {
+function buildSystemPrompt(interactionMode, userText = '') {
+  const normalizedMode = normalizeInteractionMode(interactionMode);
+  const commonPrompt = `You are a desktop software assistant that helps users navigate and operate software. The user drew RED marks on their screen to highlight areas of interest.
+
+Screen resolution: ${screenWidth}x${screenHeight} pixels.
+
+You can use the screenshot and the OmniParser summary together. Treat the screenshot as ground truth and use the OmniParser summary as extra grounding context.
+
+For normal text replies, write like a spoken assistant talking to the user in real time. Prefer short, natural conversational sentences and 1 short paragraph by default.
+Use natural dialogue tone, as if you were speaking aloud to the user beside their screen.
+Do not use markdown syntax or markdown-looking formatting unless the user explicitly asks for it. This includes headings, bullet lists, numbered lists, tables, blockquotes, code fences, inline code, and decorative markers such as #, *, -, 1., >, or backticks.
+Avoid document-style wording. Do not structure the reply like an article, report, checklist, meeting notes, or study notes.
+Do not start with phrases like "下面是", "步骤如下", "总结如下", or similar document-style lead-ins.
+Plain text only. No markdown symbols for structure.
+Always respond in the same language as the user's note. If no note is provided, use Chinese.`;
+
+  const modePrompt = normalizedMode === INTERACTION_MODE_COMPUTER
+    ? `Your job:
+1. Directly control the computer to complete the user's task whenever actions are needed.
+2. Use the computer control tools instead of telling the user to click, type, or navigate for you.
+3. If current or external information is needed and is not visible on screen, use tavily_web_search.
+
+When taking computer actions:
+- Prefer one deliberate action at a time.
+- Use absolute screen pixel coordinates.
+- After any computer control tool call, the system will automatically capture a fresh screenshot and send it back to you.
+- Re-check the updated screen before deciding the next action.
+- Do not ask the user to click or type on your behalf unless the task truly requires human judgment or credentials.
+- Do not use show_tooltip. It is unavailable in this mode.
+
+When the task is complete, reply with a short plain-text conversational summary and do not call any tool.`
+    : `Your job:
+1. Identify the software or interface in the screenshot and guide the user step by step with show_tooltip.
+2. Show only the current step. The user will click "Next" and you will receive an updated screenshot for the next step.
+3. If the user highlights text, data, or content, help organize, summarize, or record it with a normal plain-text reply when no guidance tool is needed.
+4. If current or external information is needed and is not visible on screen, use tavily_web_search.
+
+When giving step-by-step guidance, call show_tooltip for the current step instruction.
+- show_tooltip must include x and y in absolute screen pixels near the center of the relevant target area.
+- If the OmniParser summary already identifies the target element, also pass element_index with the same summary index so the UI can draw a rectangle around it.
+- If you mention a visible label such as "Model Summary", prefer the exact OmniParser item whose content exactly matches that label.
+- Do not choose nearby paragraphs or longer descriptive text when an exact label match exists.
+- Never use null for x or y.
+- Do not list all steps upfront.
+- The tooltip text must sound like a short spoken instruction, not like documentation or written notes.
+
+When all steps are complete, respond with a short plain-text conversational summary and do not call any tool.`;
+
+  return `${commonPrompt}\n\n${modePrompt}${userText ? `\n\nUser note: ${userText}` : ''}`;
+}
+
+async function buildScreenObservationContent({
+  screenshotDataUrl,
+  rawScreenshotDataUrl = '',
+  instructionText = '',
+  debugTag = 'screen',
+  existingOmniContext = null
+}) {
+  const url = normalizeImageDataUrl(screenshotDataUrl || '');
+  const omniSourceUrl = rawScreenshotDataUrl
+    ? normalizeImageDataUrl(rawScreenshotDataUrl)
+    : url;
+  let omniParserSummary = '';
+  let omniParserImageDataUrl = '';
+
+  if (url) {
+    try {
+      const omniContext = existingOmniContext && existingOmniContext.frameDataUrl === url
+        ? existingOmniContext
+        : await buildOmniParserContext(url, omniSourceUrl);
+      latestOmniParserElements = Array.isArray(omniContext.omniResult.parsedElements) ? omniContext.omniResult.parsedElements : [];
+      omniParserImageDataUrl = omniContext.omniParserImageDataUrl;
+      omniParserSummary = omniContext.omniParserSummary;
+      saveOmniParserDebugOutputs(debugTag, omniContext.omniResult, omniParserSummary);
+    } catch (error) {
+      latestOmniParserElements = [];
+      console.warn(`OmniParser 预处理失败(${debugTag})，回退到原始截图:`, error.message);
+    }
+  }
+
+  const content = [];
+  if (instructionText) {
+    content.push({ type: 'text', text: instructionText });
+  }
+  if (omniParserSummary) {
+    content.push({ type: 'text', text: omniParserSummary });
+  }
+  if (VISION_ENABLE && url) {
+    content.push({ type: 'image_url', image_url: { url } });
+  }
+  if (VISION_ENABLE && LLM_INCLUDE_OMNIPARSER_IMAGE && omniParserImageDataUrl) {
+    content.push({
+      type: 'text',
+      text: 'The next image is the same screen preprocessed by OmniParser, with numbered boxes drawn around detected UI elements.'
+    });
+    content.push({ type: 'image_url', image_url: { url: omniParserImageDataUrl } });
+  }
+
+  return {
+    content,
+    omniParserSummary,
+    omniParserImageDataUrl
+  };
+}
+
+async function runComputerControlTool(toolName, args) {
+  return new Promise((resolve, reject) => {
+    execFile(OMNIPARSER_PYTHON, [COMPUTER_CONTROL_SCRIPT_PATH, toolName, JSON.stringify(args || {})], {
+      cwd: __dirname,
+      timeout: 20_000,
+      maxBuffer: 1024 * 1024
+    }, (error, stdout, stderr) => {
+      const trimmedStdout = String(stdout || '').trim();
+      const trimmedStderr = String(stderr || '').trim();
+      let parsed = null;
+
+      if (trimmedStdout) {
+        try {
+          parsed = JSON.parse(trimmedStdout);
+        } catch {}
+      }
+
+      if (error) {
+        reject(new Error(parsed?.error || trimmedStderr || trimmedStdout || error.message));
+        return;
+      }
+
+      if (!trimmedStdout) {
+        reject(new Error('Computer control tool returned empty output'));
+        return;
+      }
+
+      if (!parsed) {
+        reject(new Error(`Computer control tool returned invalid JSON: ${trimmedStdout.slice(0, 400)}`));
+        return;
+      }
+
+      if (!parsed?.ok) {
+        reject(new Error(parsed?.error || 'Computer control tool failed'));
+        return;
+      }
+
+      resolve(parsed);
+    });
+  });
+}
+
+async function callLLM(messages, tools, hooks = {}) {
   const { onContentChunk, onToolCall } = hooks;
   const llmCallId = String(++llmCallCounter).padStart(2, '0');
   const debugPrefix = `llm_call_${llmCallId}`;
@@ -1646,6 +2021,7 @@ async function callLLM(messages, hooks = {}) {
     llm_base: LLM_BASE,
     model: LLM_MODEL,
     stream: true,
+    tool_names: Array.isArray(tools) ? tools.map(tool => tool?.function?.name || '').filter(Boolean) : [],
     message_count: Array.isArray(messages) ? messages.length : 0,
     messages: Array.isArray(messages)
       ? messages.map((message, index) => ({
@@ -1659,7 +2035,7 @@ async function callLLM(messages, hooks = {}) {
       : []
   });
 
-  const response = await fetch(`${LLM_BASE}/chat/completions`, {
+  const response = await appFetch(`${LLM_BASE}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1668,7 +2044,7 @@ async function callLLM(messages, hooks = {}) {
     body: JSON.stringify({
       model: LLM_MODEL,
       messages,
-      tools: TOOLS,
+      tools,
       stream: true
     })
   });
@@ -1706,6 +2082,8 @@ async function callLLM(messages, hooks = {}) {
   let toolCallChunkCount = 0;
   let finishReason = '';
   let sawDone = false;
+  let pendingSseEventType = '';
+  let providerStreamError = '';
 
   if (!reader) {
     writeLlmDebugJson(`${debugPrefix}_error.json`, {
@@ -1722,6 +2100,21 @@ async function callLLM(messages, hooks = {}) {
 
   if (responseContentType.includes('application/json') && !responseContentType.includes('text/event-stream')) {
     const payload = await response.json();
+    const providerErrorMessage = extractProviderErrorMessage(payload);
+    if (providerErrorMessage) {
+      writeLlmDebugJson(`${debugPrefix}_error.json`, {
+        started_at: new Date(requestStartedAt).toISOString(),
+        finished_at: new Date().toISOString(),
+        duration_ms: Date.now() - requestStartedAt,
+        status: response.status,
+        status_text: response.statusText,
+        headers: responseHeaders,
+        response_mode: 'json',
+        provider_error: providerErrorMessage,
+        payload
+      });
+      throw new Error(providerErrorMessage);
+    }
     const message = payload?.choices?.[0]?.message || {};
     textContent = typeof message?.content === 'string' ? message.content : '';
     toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
@@ -1755,9 +2148,9 @@ async function callLLM(messages, hooks = {}) {
     return { textContent, toolCalls };
   }
 
-  for await (const chunk of reader) {
+  for await (const chunk of iterateResponseBodyChunks(reader)) {
     const decodedChunk = decoder.decode(chunk, { stream: true });
-    rawStreamBytes += chunk.length || 0;
+    rawStreamBytes += chunk.byteLength || chunk.length || 0;
     if (rawStreamPreview.length < 16000) {
       rawStreamPreview += decodedChunk.slice(0, 16000 - rawStreamPreview.length);
     }
@@ -1768,12 +2161,18 @@ async function callLLM(messages, hooks = {}) {
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
+      if (trimmed.startsWith('event:')) {
+        pendingSseEventType = trimmed.slice(6).trim().toLowerCase();
+        continue;
+      }
       if (!trimmed.startsWith('data:')) {
         ignoredLineCount++;
         continue;
       }
       sseLineCount++;
       const data = trimmed.slice(5).trimStart();
+      const eventType = pendingSseEventType;
+      pendingSseEventType = '';
       if (data === '[DONE]') {
         sawDone = true;
         continue;
@@ -1783,6 +2182,12 @@ async function callLLM(messages, hooks = {}) {
       try { parsed = JSON.parse(data); } catch {
         jsonParseErrorCount++;
         continue;
+      }
+
+      const providerErrorMessage = extractProviderErrorMessage(parsed);
+      if (eventType === 'error' || providerErrorMessage) {
+        providerStreamError = providerErrorMessage || 'Provider returned an SSE error event';
+        break;
       }
 
       const delta = parsed.choices?.[0]?.delta;
@@ -1831,6 +2236,10 @@ async function callLLM(messages, hooks = {}) {
         }
       }
     }
+
+    if (providerStreamError) {
+      break;
+    }
   }
 
   if (buffer.trim() && rawStreamPreview.length < 16000) {
@@ -1865,6 +2274,21 @@ async function callLLM(messages, hooks = {}) {
   const summaryPath = writeLlmDebugJson(`${debugPrefix}_response.json`, debugSummary);
   writeLlmDebugArtifact(`${debugPrefix}_stream.txt`, rawStreamPreview || '(empty stream)');
 
+  if (providerStreamError) {
+    writeLlmDebugJson(`${debugPrefix}_error.json`, {
+      started_at: new Date(requestStartedAt).toISOString(),
+      finished_at: new Date().toISOString(),
+      duration_ms: Date.now() - requestStartedAt,
+      status: response.status,
+      status_text: response.statusText,
+      headers: responseHeaders,
+      response_mode: 'sse',
+      provider_error: providerStreamError,
+      raw_stream_preview: trimDebugText(rawStreamPreview, 8000)
+    });
+    throw new Error(providerStreamError);
+  }
+
   if (!textContent.trim() && !toolCalls.length) {
     const locationHint = summaryPath ? path.relative(__dirname, summaryPath) : `${debugPrefix}_response.json`;
     console.error(`LLM 返回空响应，调试文件: ${locationHint}`);
@@ -1897,7 +2321,7 @@ function parseToolArgs(raw) {
   return null;
 }
 
-async function executeToolCalls(textContent, toolCalls) {
+async function executeToolCalls(textContent, toolCalls, interactionMode, round) {
   console.log(`模型回复: text=${textContent.length}chars, toolCalls=${toolCalls.length}`);
 
   if (!toolCalls.length) {
@@ -1912,6 +2336,7 @@ async function executeToolCalls(textContent, toolCalls) {
 
   let hasTooltip = false;
   let needsAnotherRound = false;
+  let executedComputerAction = false;
 
   for (const tc of toolCalls) {
     const toolName = tc.function?.name || '';
@@ -1956,6 +2381,16 @@ async function executeToolCalls(textContent, toolCalls) {
         console.error('Tavily 搜索失败:', error.message);
         result = JSON.stringify({ error: error.message });
       }
+    } else if (isComputerControlToolName(toolName)) {
+      try {
+        console.log(`执行电脑操作: ${toolName} ${JSON.stringify(args)}`);
+        const toolResult = await runComputerControlTool(toolName, args);
+        result = JSON.stringify(toolResult);
+        executedComputerAction = true;
+      } catch (error) {
+        console.error(`电脑操作失败(${toolName}):`, error.message);
+        result = JSON.stringify({ error: error.message });
+      }
     } else {
       result = JSON.stringify({ error: `Unsupported tool: ${toolName}` });
     }
@@ -1963,15 +2398,34 @@ async function executeToolCalls(textContent, toolCalls) {
     stepMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
   }
 
+  if (normalizeInteractionMode(interactionMode) === INTERACTION_MODE_COMPUTER && executedComputerAction) {
+    const { rawDataUrl, previewDataUrl } = await captureFullScreenDataUrls();
+    screenshots = [previewDataUrl];
+    currentRawScreenshotDataUrl = rawDataUrl;
+    const debugTag = `computer_round_${String(round + 1).padStart(2, '0')}`;
+    const followUp = await buildScreenObservationContent({
+      screenshotDataUrl: previewDataUrl,
+      rawScreenshotDataUrl: rawDataUrl,
+      instructionText: 'Here is the updated screen after your recent computer action. Check what changed. If more work is needed, take the next best single action. If the task is complete, reply with a short plain-text conversational summary and do not call any tool.',
+      debugTag
+    });
+    stepMessages.push({
+      role: 'user',
+      content: followUp.content
+    });
+  }
+
   return { hasTooltip, needsAnotherRound };
 }
 
-async function runAgentTurn() {
+async function runAgentTurn(interactionMode) {
   let sawTooltip = false;
+  const tools = getToolsForInteractionMode(interactionMode);
+  const maxRounds = getMaxToolRoundsForInteractionMode(interactionMode);
 
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+  for (let round = 0; round < maxRounds; round++) {
     const responseTtsState = createStreamingResponseTtsState();
-    const { textContent, toolCalls } = await callLLM(stepMessages, {
+    const { textContent, toolCalls } = await callLLM(stepMessages, tools, {
       onContentChunk: chunk => responseTtsState.pushText(chunk),
       onToolCall: () => responseTtsState.onToolCall()
     });
@@ -1980,7 +2434,7 @@ async function runAgentTurn() {
     } else {
       responseTtsState.finish();
     }
-    const { hasTooltip, needsAnotherRound } = await executeToolCalls(textContent, toolCalls);
+    const { hasTooltip, needsAnotherRound } = await executeToolCalls(textContent, toolCalls, interactionMode, round);
 
     sawTooltip = sawTooltip || hasTooltip;
 
@@ -1999,75 +2453,26 @@ async function runAgentTurn() {
     }
   }
 
-  throw new Error(`Tool loop exceeded ${MAX_TOOL_ROUNDS} rounds`);
+  throw new Error(`Tool loop exceeded ${maxRounds} rounds`);
 }
 
-async function sendToModel(frames, audioBase64, userText, previewOmniContext = null, rawScreenshotDataUrl = '') {
-  const systemText = `You are a desktop software assistant that helps users navigate and operate software. The user drew RED marks on their screen to highlight areas of interest.
-
-Screen resolution: ${screenWidth}x${screenHeight} pixels.
-
-Your job:
-1. **Software guidance**: Identify the software/interface in the screenshot and provide step-by-step instructions for what the user is asking. Use show_tooltip to display the instruction for the FIRST step. Give only ONE step at a time — the user will click "Next" and you will receive an updated screenshot to guide the next step.
-2. **Information capture**: If the user highlights text, data, or content, help organize, summarize, or record it. Respond with plain text only (no tools needed).
-3. **Live web lookup**: If the user needs current or external information that is not visible on screen, use tavily_web_search before answering.
-
-When giving step-by-step guidance, call show_tooltip for the current step instruction. show_tooltip should include x and y in absolute screen pixels near the center of the relevant target area. If the OmniParser summary already identifies the target element, also pass element_index with the same summary index so the UI can draw a rectangle around it. If you mention a visible label such as "Model Summary", prefer the exact OmniParser item whose content exactly matches that label. Do not choose nearby paragraphs or longer descriptive text when an exact label match exists. Never use null for x or y. Do NOT list all steps upfront — just describe the current step. The tooltip text must sound like a short spoken instruction, not like documentation or written notes.
-Use tavily_web_search sparingly for up-to-date facts, web pages, or recent information. After getting tool results, cite the relevant URLs in your answer when helpful.
-For normal text replies, write like a spoken assistant talking to the user in real time. Prefer short, natural conversational sentences and 1 short paragraph by default.
-Use natural dialogue tone, as if you were speaking aloud to the user beside their screen.
-Do not use markdown syntax or markdown-looking formatting unless the user explicitly asks for it. This includes headings, bullet lists, numbered lists, tables, blockquotes, code fences, inline code, and decorative markers such as #, *, -, 1., >, or backticks.
-Avoid document-style wording. Do not structure the reply like an article, report, checklist, meeting notes, or study notes.
-Do not start with phrases like "下面是", "步骤如下", "总结如下", or similar document-style lead-ins.
-Plain text only. No markdown symbols for structure.
-
-When all steps are complete, respond with a summary in plain text (no tool calls) to signal you are done.
-
-Always respond in the same language as the user's note. If no note is provided, use Chinese.${userText ? '\n\nUser note: ' + userText : ''}`;
-
+async function sendToModel(frames, audioBase64, userText, previewOmniContext = null, rawScreenshotDataUrl = '', interactionMode = INTERACTION_MODE_TOOLTIP) {
+  const systemText = buildSystemPrompt(interactionMode, userText);
   stepMessages = [];
   stepNumber = 0;
 
   try {
     const imagesToSend = frames.slice(-1);
-    const content = [];
     const primaryFrame = imagesToSend[imagesToSend.length - 1] ? normalizeImageDataUrl(imagesToSend[imagesToSend.length - 1]) : '';
     const primaryOmniSourceFrame = rawScreenshotDataUrl
       ? normalizeImageDataUrl(rawScreenshotDataUrl)
       : primaryFrame;
-    let omniParserSummary = '';
-    let omniParserImageDataUrl = '';
-
-    if (primaryFrame) {
-      try {
-        const omniContext = previewOmniContext && previewOmniContext.frameDataUrl === primaryFrame
-          ? previewOmniContext
-          : await buildOmniParserContext(primaryFrame, primaryOmniSourceFrame);
-        latestOmniParserElements = Array.isArray(omniContext.omniResult.parsedElements) ? omniContext.omniResult.parsedElements : [];
-        omniParserImageDataUrl = omniContext.omniParserImageDataUrl;
-        omniParserSummary = omniContext.omniParserSummary;
-        saveOmniParserDebugOutputs('initial', omniContext.omniResult, omniParserSummary);
-      } catch (error) {
-        latestOmniParserElements = [];
-        console.warn('OmniParser 预处理失败，回退到原始截图:', error.message);
-      }
-    }
-
-    if (omniParserSummary) {
-      content.push({ type: 'text', text: omniParserSummary });
-    }
-
-    for (const frame of imagesToSend) {
-      const url = normalizeImageDataUrl(frame);
-      content.push({ type: 'image_url', image_url: { url } });
-    }
-    if (omniParserImageDataUrl) {
-      content.push({
-        type: 'text',
-        text: 'The next image is the same screen preprocessed by OmniParser, with numbered boxes drawn around detected UI elements.'
-      });
-      content.push({ type: 'image_url', image_url: { url: omniParserImageDataUrl } });
-    }
+    const { content } = await buildScreenObservationContent({
+      screenshotDataUrl: primaryFrame,
+      rawScreenshotDataUrl: primaryOmniSourceFrame,
+      debugTag: 'initial',
+      existingOmniContext: previewOmniContext
+    });
 
     stepMessages = [
       { role: 'system', content: systemText },
@@ -2075,7 +2480,7 @@ Always respond in the same language as the user's note. If no note is provided, 
       { role: 'user', content }
     ];
 
-    const { textContent, hasTooltip } = await runAgentTurn();
+    const { textContent, hasTooltip } = await runAgentTurn(interactionMode);
 
     if (!hasTooltip) {
       saveToHistory(content, textContent);
@@ -2092,46 +2497,19 @@ Always respond in the same language as the user's note. If no note is provided, 
 
 async function continueStep(screenshotDataUrl, rawScreenshotDataUrl = '') {
   try {
-    const url = normalizeImageDataUrl(screenshotDataUrl);
-    const omniSourceUrl = rawScreenshotDataUrl
-      ? normalizeImageDataUrl(rawScreenshotDataUrl)
-      : url;
-    let omniParserSummary = '';
-    let omniParserImageDataUrl = '';
-
-    try {
-      const omniResult = await preprocessScreenshotWithOmniParser(omniSourceUrl);
-      latestOmniParserElements = Array.isArray(omniResult.parsedElements) ? omniResult.parsedElements : [];
-      if (omniResult.parsedImageDataUrl) {
-        omniParserImageDataUrl = omniResult.parsedImageDataUrl;
-      }
-      const parsedSummary = summarizeOmniParserElements(omniResult.parsedElements, screenWidth, screenHeight);
-      if (parsedSummary) {
-        omniParserSummary = `OmniParser detected UI elements on the current screen. Use this as extra grounding context, but verify against the screenshot.\n${parsedSummary}`;
-      }
-      const continueTag = `continue_step_${String(stepNumber + 1).padStart(2, '0')}`;
-      saveOmniParserDebugOutputs(continueTag, omniResult, omniParserSummary);
-    } catch (error) {
-      latestOmniParserElements = [];
-      console.warn('OmniParser 续步预处理失败，回退到原始截图:', error.message);
-    }
-
-    const userContent = [
-      { type: 'text', text: `Here is the current screen after the user clicked "Next". Analyze the screenshot to determine what the user has actually done — do NOT assume the previous step was completed. Based on the current screen state, decide what the user should do next and use show_tooltip. show_tooltip should include x and y in absolute screen pixels near the center of the relevant target area, and x/y must never be null. If the target matches an OmniParser summary item, also include that element_index so the UI can highlight the element with a rectangle. If you refer to a visible label like "Model Summary", prefer the exact OmniParser item whose content exactly matches that label, not a nearby paragraph. The tooltip text must be a short natural spoken sentence, with no markdown syntax or document-style formatting. If all steps are already done, respond with a short plain-text conversational summary and do not use a tool call.` },
-      ...(omniParserSummary ? [{ type: 'text', text: omniParserSummary }] : []),
-      { type: 'image_url', image_url: { url } },
-      ...(omniParserImageDataUrl ? [
-        { type: 'text', text: 'The next image is the same screen preprocessed by OmniParser, with numbered boxes drawn around detected UI elements.' },
-        { type: 'image_url', image_url: { url: omniParserImageDataUrl } }
-      ] : [])
-    ];
+    const userContent = (await buildScreenObservationContent({
+      screenshotDataUrl,
+      rawScreenshotDataUrl,
+      instructionText: 'Here is the current screen after the user clicked "Next". Analyze what the user has actually done. Do not assume the previous step was completed. Based on the current screen state, decide what the user should do next and use show_tooltip. show_tooltip must include x and y in absolute screen pixels near the center of the relevant target area, and x and y must never be null. If the target matches an OmniParser summary item, also include that element_index so the UI can highlight the element with a rectangle. If you refer to a visible label like "Model Summary", prefer the exact OmniParser item whose content exactly matches that label, not a nearby paragraph. The tooltip text must be a short natural spoken sentence with no markdown syntax or document-style formatting. If all steps are already done, respond with a short plain-text conversational summary and do not use a tool call.',
+      debugTag: `continue_step_${String(stepNumber + 1).padStart(2, '0')}`
+    })).content;
 
     stepMessages.push({
       role: 'user',
       content: userContent
     });
 
-    const { textContent, hasTooltip } = await runAgentTurn();
+    const { textContent, hasTooltip } = await runAgentTurn(INTERACTION_MODE_TOOLTIP);
 
     if (!hasTooltip) {
       saveToHistory(userContent, textContent);
@@ -2146,6 +2524,7 @@ async function continueStep(screenshotDataUrl, rawScreenshotDataUrl = '') {
 }
 
 app.whenReady().then(async () => {
+  await configureProxyFromEnv();
   await createMaskWindow();
   ensureTtsServiceReady().catch(error => {
     console.warn('TTS 服务预热失败:', error.message);
