@@ -22,15 +22,15 @@ function firstNonEmptyEnvValue(...values) {
   return '';
 }
 
-const LLM_BASE = process.env.LLM_BASE || 'http://54.219.66.60:3000/v1';
-const LLM_MODEL = process.env.LLM_MODEL || 'gpt-5.4';
-const LLM_API_KEY = process.env.LLM_API_KEY || 'sk-Q8fv7Pdn1xGMCRsBawXvUlU4jY3sHSetRkAUP6MeI8L0iiqn';
+const LLM_BASE = process.env.LLM_BASE;
+const LLM_MODEL = process.env.LLM_MODEL;
+const LLM_API_KEY = process.env.LLM_API_KEY;
 const LOCAL_LLM_COMPACT_MODE = /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?(?:\/|$)/i.test(LLM_BASE);
 const VISION_ENABLE = parseEnvBool(process.env.VISION_ENABLE, true);
 const TAVILY_BASE = process.env.TAVILY_BASE || 'https://api.tavily.com/search';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 const MAX_TOOL_ROUNDS = 4;
-const TTS_REPO_PATH = process.env.MOSS_TTS_REPO_PATH || '/Users/huanghan/Desktop/Projects/MOSS-TTS-Nano';
+const TTS_REPO_PATH = process.env.MOSS_TTS_REPO_PATH || path.join(__dirname, 'MOSS-TTS-Nano');
 const TTS_HOST = process.env.MOSS_TTS_HOST || '127.0.0.1';
 const TTS_PORT = Number.parseInt(process.env.MOSS_TTS_PORT || '18083', 10);
 const TTS_BASE = `http://${TTS_HOST}:${TTS_PORT}`;
@@ -48,13 +48,17 @@ const TTS_DEMO_METADATA_PATH = path.join(TTS_REPO_PATH, 'assets', 'demo.jsonl');
 const TTS_HF_HOME = process.env.MOSS_TTS_HF_HOME || path.join(__dirname, '.cache', 'moss-huggingface');
 const TTS_HF_MODULES_CACHE = process.env.HF_MODULES_CACHE || path.join(TTS_HF_HOME, 'modules');
 const TTS_TRANSFORMERS_CACHE = process.env.TRANSFORMERS_CACHE || path.join(TTS_HF_HOME, 'hub');
-const OMNIPARSER_REPO_PATH = process.env.OMNIPARSER_REPO_PATH || '/Users/huanghan/Desktop/Projects/OmniParser';
+const OMNIPARSER_REPO_PATH = process.env.OMNIPARSER_REPO_PATH || path.join(__dirname, 'OmniParser');
 const OMNIPARSER_SERVER_DIR = path.join(OMNIPARSER_REPO_PATH, 'omnitool', 'omniparserserver');
 const OMNIPARSER_HOST = process.env.OMNIPARSER_HOST || '127.0.0.1';
 const OMNIPARSER_PORT = Number.parseInt(process.env.OMNIPARSER_PORT || '18084', 10);
 const OMNIPARSER_BASE = `http://${OMNIPARSER_HOST}:${OMNIPARSER_PORT}`;
-const OMNIPARSER_PYTHON = process.env.OMNIPARSER_PYTHON
-  || (fs.existsSync(path.join(OMNIPARSER_REPO_PATH, '.venv', 'bin', 'python')) ? path.join(OMNIPARSER_REPO_PATH, '.venv', 'bin', 'python') : 'python3');
+const OMNIPARSER_PYTHON_ENV = process.env.OMNIPARSER_PYTHON || '';
+function getOmniParserPython() {
+  if (OMNIPARSER_PYTHON_ENV) return OMNIPARSER_PYTHON_ENV;
+  const venvPython = path.join(OMNIPARSER_REPO_PATH, '.venv', 'bin', 'python');
+  return fs.existsSync(venvPython) ? venvPython : 'python3';
+}
 const OMNIPARSER_HEALTH_TIMEOUT_MS = 120_000;
 const OMNIPARSER_REQUEST_TIMEOUT_MS = 90_000;
 const OMNIPARSER_SOM_MODEL_PATH = process.env.OMNIPARSER_SOM_MODEL_PATH || path.join(OMNIPARSER_REPO_PATH, 'weights', 'icon_detect', 'model.pt');
@@ -540,8 +544,9 @@ function spawnOmniParserService() {
     spawnArgs.push('--device', OMNIPARSER_DEVICE);
   }
 
-  console.log(`启动 OmniParser 服务: ${OMNIPARSER_PYTHON} ${spawnArgs.join(' ')}`);
-  omniParserProcess = spawn(OMNIPARSER_PYTHON, spawnArgs, {
+  const omniPython = getOmniParserPython();
+  console.log(`启动 OmniParser 服务: ${omniPython} ${spawnArgs.join(' ')}`);
+  omniParserProcess = spawn(omniPython, spawnArgs, {
     cwd: OMNIPARSER_SERVER_DIR,
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
@@ -572,26 +577,16 @@ async function waitForOmniParserHealthy(timeoutMs = OMNIPARSER_HEALTH_TIMEOUT_MS
 }
 
 async function ensureOmniParserReady() {
-  if (!isOmniParserConfigured()) {
-    throw new Error('OmniParser 未配置完整，缺少服务目录或模型权重');
-  }
-
-  if (await isOmniParserHealthy()) return true;
-
-  if (omniParserReadyPromise) {
-    try {
-      await omniParserReadyPromise;
-    } catch {}
-
-    if (await isOmniParserHealthy()) {
-      return true;
-    }
-
-    omniParserReadyPromise = null;
-  }
-
   if (!omniParserReadyPromise) {
     omniParserReadyPromise = (async () => {
+      await setupOmniParserDependencies();
+
+      if (!isOmniParserConfigured()) {
+        throw new Error('OmniParser 未配置完整，缺少服务目录或模型权重');
+      }
+
+      if (await isOmniParserHealthy()) return true;
+
       spawnOmniParserService();
       const ready = await waitForOmniParserHealthy();
       if (!ready) {
@@ -948,6 +943,159 @@ function pushPreviewWindow(frames, previewId, omniSourceFrameDataUrl = '') {
   void updatePreviewOmniParser();
 }
 
+async function setupTtsDependencies() {
+  const venvPath = path.join(TTS_REPO_PATH, '.venv');
+  const venvPython = path.join(venvPath, 'bin', 'python');
+
+  if (fs.existsSync(venvPython)) {
+    console.log('TTS 虚拟环境已存在，跳过安装');
+    return true;
+  }
+
+  console.log('正在为 TTS 创建虚拟环境并安装依赖...');
+
+  return new Promise((resolve, reject) => {
+    const setupScript = `
+set -e
+cd "${TTS_REPO_PATH}"
+if command -v uv &> /dev/null && [ -f uv.lock ]; then
+  echo "使用 uv 安装依赖..."
+  uv sync
+  uv pip install -p .venv/bin/python --no-deps WeTextProcessing
+  uv pip install -p .venv/bin/python soundfile importlib_resources
+else
+  echo "使用 pip 安装依赖..."
+  python3 -m venv .venv
+  .venv/bin/pip install --upgrade pip
+  .venv/bin/pip install -r requirements.txt
+fi
+echo "TTS 依赖安装完成"
+`;
+
+    const child = spawn('bash', ['-c', setupScript], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    child.stdout.on('data', chunk => {
+      process.stdout.write(`[tts-setup] ${chunk.toString()}`);
+    });
+
+    child.stderr.on('data', chunk => {
+      process.stderr.write(`[tts-setup] ${chunk.toString()}`);
+    });
+
+    child.on('exit', (code) => {
+      if (code === 0) {
+        console.log('TTS 依赖安装成功');
+        resolve(true);
+      } else {
+        reject(new Error(`TTS 依赖安装失败，退出码: ${code}`));
+      }
+    });
+
+    child.on('error', reject);
+  });
+}
+
+async function setupOmniParserDependencies() {
+  const venvPath = path.join(OMNIPARSER_REPO_PATH, '.venv');
+  const venvPython = path.join(venvPath, 'bin', 'python');
+  const weightsPath = path.join(OMNIPARSER_REPO_PATH, 'weights');
+  const modelPath = path.join(weightsPath, 'icon_detect', 'model.pt');
+
+  const needsVenv = !fs.existsSync(venvPython);
+  const needsWeights = !fs.existsSync(modelPath);
+
+  if (!needsVenv && !needsWeights) {
+    console.log('OmniParser 环境和权重已存在，跳过安装');
+    return true;
+  }
+
+  console.log('正在为 OmniParser 设置环境...');
+
+  return new Promise((resolve, reject) => {
+    const setupScript = `
+set -e
+cd "${OMNIPARSER_REPO_PATH}"
+
+${needsVenv ? `
+echo "创建虚拟环境并安装依赖..."
+if command -v uv &> /dev/null; then
+  uv venv .venv
+  uv pip install -p .venv/bin/python -r requirements.txt
+else
+  python3 -m venv .venv
+  .venv/bin/pip install --upgrade pip
+  .venv/bin/pip install -r requirements.txt
+fi
+` : ''}
+
+${needsWeights ? `
+echo "下载模型权重..."
+mkdir -p weights
+
+# 查找 hf 命令
+HF_CLI=""
+if command -v hf &> /dev/null; then
+  HF_CLI="hf"
+elif [ -x ".venv/bin/hf" ]; then
+  HF_CLI=".venv/bin/hf"
+elif [ -x ".venv/bin/huggingface-cli" ]; then
+  HF_CLI=".venv/bin/huggingface-cli"
+elif command -v huggingface-cli &> /dev/null; then
+  HF_CLI="huggingface-cli"
+fi
+
+if [ -z "$HF_CLI" ]; then
+  echo "安装 huggingface_hub..."
+  .venv/bin/pip install huggingface_hub
+  if [ -x ".venv/bin/hf" ]; then
+    HF_CLI=".venv/bin/hf"
+  else
+    HF_CLI=".venv/bin/huggingface-cli"
+  fi
+fi
+
+echo "使用 $HF_CLI 下载权重..."
+"$HF_CLI" download microsoft/OmniParser-v2.0 icon_detect/train_args.yaml --local-dir weights
+"$HF_CLI" download microsoft/OmniParser-v2.0 icon_detect/model.pt --local-dir weights
+"$HF_CLI" download microsoft/OmniParser-v2.0 icon_detect/model.yaml --local-dir weights
+"$HF_CLI" download microsoft/OmniParser-v2.0 icon_caption/config.json --local-dir weights
+"$HF_CLI" download microsoft/OmniParser-v2.0 icon_caption/generation_config.json --local-dir weights
+"$HF_CLI" download microsoft/OmniParser-v2.0 icon_caption/model.safetensors --local-dir weights
+if [ -d weights/icon_caption ] && [ ! -d weights/icon_caption_florence ]; then
+  mv weights/icon_caption weights/icon_caption_florence
+fi
+` : ''}
+
+echo "OmniParser 设置完成"
+`;
+
+    const child = spawn('bash', ['-c', setupScript], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    child.stdout.on('data', chunk => {
+      process.stdout.write(`[omni-setup] ${chunk.toString()}`);
+    });
+
+    child.stderr.on('data', chunk => {
+      process.stderr.write(`[omni-setup] ${chunk.toString()}`);
+    });
+
+    child.on('exit', (code) => {
+      if (code === 0) {
+        console.log('OmniParser 设置成功');
+        resolve(true);
+      } else {
+        reject(new Error(`OmniParser 设置失败，退出码: ${code}`));
+      }
+    });
+
+    child.on('error', reject);
+  });
+}
+
 async function isTtsServiceHealthy() {
   try {
     const response = await fetchWithTimeout(`${TTS_BASE}/health`, {}, 1500);
@@ -1030,6 +1178,7 @@ async function ensureTtsServiceReady() {
 
   if (!ttsReadyPromise) {
     ttsReadyPromise = (async () => {
+      await setupTtsDependencies();
       spawnTtsService();
       const ready = await waitForTtsHealthy();
       if (!ready) {
@@ -1971,7 +2120,7 @@ async function buildScreenObservationContent({
 
 async function runComputerControlTool(toolName, args) {
   return new Promise((resolve, reject) => {
-    execFile(OMNIPARSER_PYTHON, [COMPUTER_CONTROL_SCRIPT_PATH, toolName, JSON.stringify(args || {})], {
+    execFile(getOmniParserPython(), [COMPUTER_CONTROL_SCRIPT_PATH, toolName, JSON.stringify(args || {})], {
       cwd: __dirname,
       timeout: 20_000,
       maxBuffer: 1024 * 1024
@@ -2529,11 +2678,9 @@ app.whenReady().then(async () => {
   ensureTtsServiceReady().catch(error => {
     console.warn('TTS 服务预热失败:', error.message);
   });
-  if (isOmniParserConfigured()) {
-    ensureOmniParserReady().catch(error => {
-      console.warn('OmniParser 服务预热失败:', error.message);
-    });
-  }
+  ensureOmniParserReady().catch(error => {
+    console.warn('OmniParser 服务预热失败:', error.message);
+  });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('will-quit', () => {

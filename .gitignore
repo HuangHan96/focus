@@ -3,3 +3,6 @@ tmp/
 .env
 .cache/
 __pycache__/
+
+midscene_run/
+.env

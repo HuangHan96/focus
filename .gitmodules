@@ -1,0 +1,6 @@
+[submodule "MOSS-TTS-Nano"]
+	path = MOSS-TTS-Nano
+	url = git@github.com:HuangHan96/MOSS-TTS-Nano.git
+[submodule "OmniParser"]
+	path = OmniParser
+	url = git@github.com:HuangHan96/OmniParser.git
