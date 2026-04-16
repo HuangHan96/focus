@@ -36,7 +36,7 @@ The app runs as a transparent always-on-top overlay. When not in drawing mode, a
 ### 1. Clone the repository with submodules
 
 ```bash
-git clone --recursive https://github.com/yourusername/focus.git
+git clone --recursive https://github.com/HuangHan96/focus.git
 cd focus
 ```
 
